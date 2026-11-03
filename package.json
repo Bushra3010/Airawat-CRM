@@ -1,0 +1,27 @@
+{
+  "name": "airawat-showroom",
+  "version": "1.0.0",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "seed": "node src/seed.js",
+    "test": "node --test test/",
+    "cert": "sh scripts/make-cert.sh"
+  },
+  "description": "Airawat Handicraft showroom product finder, piece tracking, barcode/QR labels and product videos",
+  "dependencies": {
+    "@zxing/library": "^0.21.3",
+    "better-sqlite3": "^11.10.0",
+    "express": "^4.22.3",
+    "html5-qrcode": "^2.3.8",
+    "pdfkit": "^0.15.2",
+    "qrcode": "1.5"
+  },
+  "devDependencies": {
+    "jsqr": "^1.4.0"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  }
+}

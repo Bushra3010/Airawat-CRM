@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#e0232a">
+  <title>Airawat Showroom</title>
+  <link rel="icon" href="/mark.png">
+  <link rel="apple-touch-icon" href="/mark.png">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="top">
+    <a href="#/find" class="brand"><img src="/mark.png" alt=""><span>AIRAWAT <b>SHOWROOM</b></span></a>
+    <div id="custbar" class="custbar" hidden></div>
+    <div class="who" id="who"></div>
+  </header>
+  <nav class="tabs" id="tabs" hidden>
+    <a href="#/find" data-tab="find"><span class="ic">⌕</span>Find</a>
+    <a href="#/scan" data-tab="scan"><span class="ic">▣</span>Scan</a>
+    <a href="#/shortlists" data-tab="shortlists"><span class="ic">♡</span>Shortlists</a>
+    <a href="#/stock" data-tab="stock"><span class="ic">⇄</span>Stock</a>
+    <a href="#/more" data-tab="more"><span class="ic">≡</span>More</a>
+  </nav>
+  <main id="view" tabindex="-1"></main>
+  <div id="sheet" class="sheet" hidden><div class="sheet-bg" data-close></div><div class="sheet-body" role="dialog" aria-modal="true"></div></div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
