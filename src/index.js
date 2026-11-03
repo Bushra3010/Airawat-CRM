@@ -5,7 +5,7 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 const https = require('https');
-const { open, migrate } = require('./db');
+const { open } = require('./db');
 const { createApp } = require('./server');
 
 const root = path.join(__dirname, '..');
@@ -27,12 +27,10 @@ async function localDatabaseUrl() {
 async function main() {
   const url = process.env.DATABASE_URL || await localDatabaseUrl();
   const db = open(url);
-  await migrate(db);
-  if ((await db.one('SELECT COUNT(*)::int n FROM users')).n === 0) {
-    await require('./seed').seed(db, { photoDir: path.join(root, 'public', 'seed-img') });
-    console.log('Empty database: demo data loaded (see src/seed.js for demo logins).');
-  }
-  const app = createApp({ db, publicBaseUrl: process.env.PUBLIC_BASE_URL });
+  // Private local database: demo data. Supabase: first admin from ADMIN_INITIAL_PASSWORD (DEMO_DATA=1 for demo data).
+  const { ensureReady } = require('./bootstrap');
+  await ensureReady(db, process.env.DATABASE_URL ? {} : { demo: true });
+  const app = createApp({ db, publicBaseUrl: process.env.PUBLIC_BASE_URL, ready: () => ensureReady(db) });
 
   // Phone cameras need HTTPS (or localhost). Uses HTTPS_KEY / HTTPS_CERT, or the
   // certificate made by `npm run cert` in certs/.

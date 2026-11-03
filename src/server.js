@@ -35,9 +35,18 @@ function parseCookies(req) {
 const fail = (message, status = 400) => Object.assign(new Error(message), { status });
 
 // ---------------- App ----------------
-function createApp({ db, uploadDir = path.join(__dirname, '..', 'data', 'uploads'), publicBaseUrl, serveStatic = true } = {}) {
+function createApp({ db, uploadDir = path.join(__dirname, '..', 'data', 'uploads'), publicBaseUrl, serveStatic = true, ready } = {}) {
   const app = express();
   app.disable('x-powered-by');
+  // First-run setup (tables, bucket, admin login) before any dynamic request.
+  if (ready) {
+    app.use(['/api', '/p/', '/c/'], async (req, res, next) => {
+      try { await ready(); next(); } catch (e) {
+        console.error(e.message);
+        res.status(503).json({ error: e.status === 503 ? e.message : 'The app is starting up — please try again in a moment' });
+      }
+    });
+  }
   app.set('trust proxy', process.env.NETLIFY || process.env.TRUST_PROXY ? true : 'loopback');
 
   const baseUrl = async (req) => {
@@ -131,9 +140,18 @@ function createApp({ db, uploadDir = path.join(__dirname, '..', 'data', 'uploads
     next();
   });
 
+  const MAX_FAILURES = 8;   // per username per 15 minutes
   api.post('/login', wrap(async (req, res) => {
-    const u = await db.one('SELECT * FROM users WHERE username = $1 AND active = 1', [String(req.body.username || '').toLowerCase()]);
-    if (!u || !verifyPassword(req.body.password || '', u.pass_hash)) throw fail('Wrong username or password', 401);
+    const username = String(req.body.username || '').trim().toLowerCase().slice(0, 60);
+    const { n } = await db.one("SELECT COUNT(*)::int n FROM login_failures WHERE username = $1 AND ts > now() - interval '15 minutes'", [username]);
+    if (n >= MAX_FAILURES) throw fail('Too many wrong passwords — wait 15 minutes or ask an admin to reset it', 429);
+    const u = await db.one('SELECT * FROM users WHERE username = $1 AND active = 1', [username]);
+    if (!u || !verifyPassword(req.body.password || '', u.pass_hash)) {
+      await db.query('INSERT INTO login_failures (username) VALUES ($1)', [username]);
+      if (Math.random() < 0.05) await db.query("DELETE FROM login_failures WHERE ts < now() - interval '1 day'");
+      throw fail('Wrong username or password', 401);
+    }
+    await db.query('DELETE FROM login_failures WHERE username = $1', [username]);
     const token = crypto.randomBytes(24).toString('base64url');
     await db.query('INSERT INTO sessions (token, user_id, expires_at) VALUES ($1, $2, $3)', [token, u.id, Date.now() + 12 * 3600e3]);
     if (Math.random() < 0.05) await db.query('DELETE FROM sessions WHERE expires_at < $1', [Date.now()]);
@@ -159,6 +177,64 @@ function createApp({ db, uploadDir = path.join(__dirname, '..', 'data', 'uploads
   }));
   api.get('/me', wrap(async (req) => ({ ...req.user, permissions: permsOf(req.user), business_name: await businessName() })));
   api.get('/locations', need('view'), wrap(() => db.query('SELECT * FROM locations ORDER BY type, name')));
+
+  // ---------- Staff users & passwords ----------
+  const MIN_PW = 10;
+  const checkPw = (pw) => { if (String(pw || '').length < MIN_PW) throw fail(`Password must be at least ${MIN_PW} characters`); };
+  const USER_COLS = 'id, username, name, role, active';
+  api.post('/me/password', wrap(async (req) => {
+    const u = await db.one('SELECT * FROM users WHERE id = $1', [req.user.id]);
+    if (!verifyPassword(req.body.current_password || '', u.pass_hash)) throw fail('Current password is wrong', 403);
+    checkPw(req.body.new_password);
+    await db.query('UPDATE users SET pass_hash = $1 WHERE id = $2', [hashPassword(req.body.new_password), u.id]);
+    await db.query('DELETE FROM sessions WHERE user_id = $1 AND token != $2', [u.id, req.sessionToken]);   // sign out other devices
+    return { ok: true };
+  }));
+  api.get('/users', need('manage_users'), wrap(() => db.query(`SELECT ${USER_COLS} FROM users ORDER BY active DESC, role, name`)));
+  api.post('/users', need('manage_users'), wrap(async (req) => {
+    const x = req.body;
+    const username = String(x.username || '').trim().toLowerCase();
+    if (!/^[a-z0-9._-]{3,40}$/.test(username)) throw fail('Username: 3–40 letters, numbers, dots, dashes or underscores');
+    if (!ROLE_PERMS[x.role]) throw fail('Choose a role');
+    if (!String(x.name || '').trim()) throw fail('Enter the person\'s name');
+    checkPw(x.password);
+    if (await db.one('SELECT id FROM users WHERE username = $1', [username])) throw fail('That username is taken', 409);
+    return db.one(`INSERT INTO users (username, name, role, pass_hash) VALUES ($1, $2, $3, $4) RETURNING ${USER_COLS}`, [username, String(x.name).trim().slice(0, 80), x.role, hashPassword(x.password)]);
+  }));
+  api.patch('/users/:id', need('manage_users'), wrap(async (req) => {
+    const id = Number(req.params.id), x = req.body;
+    const u = await db.one('SELECT * FROM users WHERE id = $1', [id]);
+    if (!u) throw fail('User not found', 404);
+    const demoting = ('role' in x && x.role !== 'admin') || ('active' in x && !x.active);
+    if (u.role === 'admin' && demoting) {
+      const { n } = await db.one("SELECT COUNT(*)::int n FROM users WHERE role = 'admin' AND active = 1 AND id != $1", [id]);
+      if (!n) throw fail('Keep at least one active admin');
+    }
+    if ('role' in x) { if (!ROLE_PERMS[x.role]) throw fail('Choose a role'); await db.query('UPDATE users SET role = $1 WHERE id = $2', [x.role, id]); }
+    if ('name' in x && String(x.name).trim()) await db.query('UPDATE users SET name = $1 WHERE id = $2', [String(x.name).trim().slice(0, 80), id]);
+    if ('active' in x) await db.query('UPDATE users SET active = $1 WHERE id = $2', [x.active ? 1 : 0, id]);
+    if ('password' in x) { checkPw(x.password); await db.query('UPDATE users SET pass_hash = $1 WHERE id = $2', [hashPassword(x.password), id]); await db.query('DELETE FROM login_failures WHERE username = $1', [u.username]); }
+    // role, deactivation or password reset signs the person out everywhere
+    if ('role' in x || 'active' in x || 'password' in x) await db.query('DELETE FROM sessions WHERE user_id = $1 AND token != $2', [id, req.sessionToken]);
+    return db.one(`SELECT ${USER_COLS} FROM users WHERE id = $1`, [id]);
+  }));
+
+  // ---------- Locations ----------
+  const LOC_TYPES = ['showroom', 'warehouse', 'branch'];
+  api.post('/locations', need('manage_settings'), wrap(async (req) => {
+    const x = req.body;
+    const code = String(x.code || '').trim().toUpperCase();
+    if (!/^[A-Z0-9-]{2,10}$/.test(code)) throw fail('Code: 2–10 letters or numbers');
+    if (!String(x.name || '').trim()) throw fail('Enter a name');
+    if (!LOC_TYPES.includes(x.type)) throw fail('Choose showroom, warehouse or branch');
+    return db.one('INSERT INTO locations (code, name, type) VALUES ($1, $2, $3) RETURNING *', [code, String(x.name).trim().slice(0, 80), x.type]);
+  }));
+  api.patch('/locations/:id', need('manage_settings'), wrap(async (req) => {
+    const x = req.body, id = Number(req.params.id);
+    if ('name' in x && String(x.name).trim()) await db.query('UPDATE locations SET name = $1 WHERE id = $2', [String(x.name).trim().slice(0, 80), id]);
+    if ('type' in x) { if (!LOC_TYPES.includes(x.type)) throw fail('Choose showroom, warehouse or branch'); await db.query('UPDATE locations SET type = $1 WHERE id = $2', [x.type, id]); }
+    return db.one('SELECT * FROM locations WHERE id = $1', [id]);
+  }));
 
   // ---------- Finder ----------
   api.get('/search', need('view'), wrap((req) => catalog.search(db, req.query)));

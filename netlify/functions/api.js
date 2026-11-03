@@ -4,9 +4,10 @@
 const serverless = require('serverless-http');
 const { open } = require('../../src/db');
 const { createApp } = require('../../src/server');
+const { ensureReady } = require('../../src/bootstrap');
 
 const db = open(process.env.DATABASE_URL, { max: Number(process.env.DB_POOL_MAX || 2) });
-const handler = serverless(createApp({ db, serveStatic: false }), { binary: ['application/pdf'] });
+const handler = serverless(createApp({ db, serveStatic: false, ready: () => ensureReady(db) }), { binary: ['application/pdf'] });
 const PREFIX = '/.netlify/functions/api';
 
 exports.handler = async (event, context) => {
