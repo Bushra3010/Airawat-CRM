@@ -67,11 +67,11 @@ const DEFAULT_TEMPLATES = [
 const fmtPrice = (n) => `Rs. ${Math.round(n).toLocaleString('en-IN')}`;
 
 /** Whitelisted label content for a product or piece. */
-function labelData(db, { type, id }, opts, baseUrl, businessName) {
+async function labelData(db, { type, id }, opts, baseUrl, businessName) {
   if (type === 'piece') {
-    const pc = db.prepare('SELECT id, piece_code, public_token, mfr_barcode, selling_price, product_id, finish_note FROM pieces WHERE id = ?').get(id);
+    const pc = await db.one('SELECT id, piece_code, public_token, mfr_barcode, selling_price, product_id, finish_note FROM pieces WHERE id = $1', [id]);
     if (!pc) throw Object.assign(new Error(`Piece ${id} not found`), { status: 404 });
-    const p = db.prepare('SELECT name, variant_label, sku, selling_price, short_specs, length_cm, width_cm, height_cm, material, finish FROM products WHERE id = ?').get(pc.product_id);
+    const p = await db.one('SELECT name, variant_label, sku, selling_price, short_specs, length_cm, width_cm, height_cm, material, finish FROM products WHERE id = $1', [pc.product_id]);
     return {
       business: businessName, name: p.variant_label ? `${p.name} — ${p.variant_label}` : p.name, sku: p.sku,
       piece_code: opts.show_piece_id === false ? null : pc.piece_code,
@@ -81,7 +81,7 @@ function labelData(db, { type, id }, opts, baseUrl, businessName) {
       specs: opts.show_specs ? (p.short_specs || [dims(p), p.material, pc.finish_note || p.finish].filter(Boolean).join(' · ')) : null,
     };
   }
-  const p = db.prepare('SELECT name, variant_label, sku, internal_code, public_token, mfr_barcode, selling_price, short_specs, length_cm, width_cm, height_cm, material, finish FROM products WHERE id = ?').get(id);
+  const p = await db.one('SELECT name, variant_label, sku, internal_code, public_token, mfr_barcode, selling_price, short_specs, length_cm, width_cm, height_cm, material, finish FROM products WHERE id = $1', [id]);
   if (!p) throw Object.assign(new Error(`Product ${id} not found`), { status: 404 });
   return {
     business: businessName, name: p.variant_label ? `${p.name} — ${p.variant_label}` : p.name, sku: p.sku, piece_code: null,

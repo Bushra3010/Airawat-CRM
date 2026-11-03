@@ -2,16 +2,28 @@
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
-const { open } = require('../src/db');
+const { open, migrate } = require('../src/db');
 const { seed, USERS } = require('../src/seed');
 const { createApp } = require('../src/server');
 
-/** Fresh file-backed database + running server for each test file. */
+/** Real PostgreSQL for tests: TEST_DATABASE_URL if given, otherwise a throwaway embedded server. */
+async function startPostgres(dir) {
+  if (process.env.TEST_DATABASE_URL) return { url: process.env.TEST_DATABASE_URL, stop: async () => {} };
+  const { default: EmbeddedPostgres } = await import('embedded-postgres');
+  const port = 55000 + Math.floor(Math.random() * 5000);
+  const pg = new EmbeddedPostgres({ databaseDir: path.join(dir, 'pg'), user: 'postgres', password: 'test', port, persistent: false, onLog: () => {} });
+  await pg.initialise();
+  await pg.start();
+  return { url: `postgres://postgres:test@localhost:${port}/postgres`, stop: () => pg.stop() };
+}
+
+/** Fresh database + running server for a test file. */
 async function setup() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'airawat-test-'));
-  const file = path.join(dir, 'test.db');
-  const db = open(file);
-  const ids = seed(db, {});
+  const pg = await startPostgres(dir);
+  const db = open(pg.url, { max: 10 });
+  await migrate(db);
+  const ids = await seed(db, {});
   const app = createApp({ db, uploadDir: path.join(dir, 'uploads'), publicBaseUrl: 'https://showroom.example.test' });
   const server = await new Promise((res) => { const s = app.listen(0, '127.0.0.1', () => res(s)); });
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -28,8 +40,13 @@ async function setup() {
     };
     return { get: (p) => call('GET', p), post: (p, b = {}) => call('POST', p, b), put: (p, b) => call('PUT', p, b), patch: (p, b) => call('PATCH', p, b), del: (p) => call('DELETE', p) };
   }
-  const close = () => new Promise((r) => server.close(() => { db.close(); fs.rmSync(dir, { recursive: true, force: true }); r(); }));
-  return { db, file, ids, base, login, close };
+  const close = async () => {
+    await new Promise((r) => server.close(r));
+    await db.close();
+    await pg.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  };
+  return { db, url: pg.url, ids, base, login, close };
 }
 
 module.exports = { setup };

@@ -18,8 +18,8 @@ const DEFAULT_WORDING = {
   in_transit: 'Please ask showroom staff',
 };
 
-function settings(db) {
-  const s = Object.fromEntries(db.prepare('SELECT key, value FROM settings').all().map((r) => [r.key, r.value]));
+async function settings(db) {
+  const s = Object.fromEntries((await db.query('SELECT key, value FROM settings')).map((r) => [r.key, r.value]));
   let wording = DEFAULT_WORDING;
   try { wording = { ...DEFAULT_WORDING, ...JSON.parse(s.availability_wording || '{}') }; } catch { /* keep defaults */ }
   return {
@@ -42,39 +42,37 @@ function publicProductFields(p) {
   };
 }
 
-function publicVideos(db, productId, pieceId) {
-  return videosFor(db, { productId, pieceId }, { includeInternal: false }).map((v) => ({
+async function publicVideos(db, productId, pieceId) {
+  return (await videosFor(db, { productId, pieceId }, { includeInternal: false })).map((v) => ({
     title: v.title, youtube_id: v.youtube_id, url: v.url, thumbnail: v.thumbnail, video_type: v.video_type,
     is_primary: v.is_primary, scope_label: v.scope_label, embeddable: v.embed_status !== 'embed_disabled' && v.embed_status !== 'unavailable',
     unavailable: v.embed_status === 'unavailable',
   })).filter((v) => !v.unavailable);
 }
 
+const publicPhotos = async (db, productId, pieceId) => (await photosFor(db, productId, pieceId, true))
+  .map((ph) => ({ url: ph.url, caption: ph.caption || null, exact_piece: !!ph.exact_piece }));
+
 /** Data for the customer QR page of a product or piece, or null if not public. */
-function publicItem(db, token) {
-  const s = settings(db);
+async function publicItem(db, token) {
+  const s = await settings(db);
   if (!s.public_pages_enabled || !/^[A-Za-z0-9_-]{8,32}$/.test(String(token))) return null;
-  let product, piece = null;
-  piece = db.prepare('SELECT * FROM pieces WHERE public_token = ?').get(token);
+  let product;
+  const piece = await db.one('SELECT * FROM pieces WHERE public_token = $1', [token]);
   if (piece) {
     if (!piece.public_enabled) return null;
-    product = db.prepare('SELECT * FROM products WHERE id = ?').get(piece.product_id);
+    product = await db.one('SELECT * FROM products WHERE id = $1', [piece.product_id]);
   } else {
-    product = db.prepare('SELECT * FROM products WHERE public_token = ?').get(token);
+    product = await db.one('SELECT * FROM products WHERE public_token = $1', [token]);
   }
   if (!product || !product.public_enabled || !product.active) return null;
 
-  let status;
-  if (piece) status = inv.pieceStatus(piece);
-  else status = inv.productAvailability(db, product.id).status;
+  const avail = piece ? null : await inv.productAvailability(db, product.id);
+  const status = piece ? inv.pieceStatus(piece) : avail.status;
   // a price implies the item can be bought: hide it for display-only, damaged and sold items
   const showPrice = s.public_show_prices && !!product.public_show_price && !['sold', 'display_only', 'damaged'].includes(status);
   const price = piece ? (piece.selling_price ?? product.selling_price) : product.selling_price;
-  let expected = null;
-  if (s.public_show_expected_date && !piece && status !== 'available_now') {
-    const e = inv.productAvailability(db, product.id).expected;
-    if (e) expected = e.date;
-  }
+  const expected = s.public_show_expected_date && avail && status !== 'available_now' && avail.expected ? avail.expected.date : null;
   return {
     business_name: s.business_name, showroom_contact: s.showroom_contact, currency: s.currency,
     kind: piece ? 'piece' : 'product',
@@ -83,30 +81,31 @@ function publicItem(db, token) {
     price: showPrice && price != null ? price : null,
     availability_text: s.wording[status] || s.wording.out_of_stock,
     expected_date: expected,
-    photos: photosFor(db, product.id, piece && piece.id, true).map((ph) => ({ url: ph.url, caption: ph.caption || null, exact_piece: !!ph.exact_piece })),
-    videos: publicVideos(db, product.id, piece && piece.id),
+    photos: await publicPhotos(db, product.id, piece && piece.id),
+    videos: await publicVideos(db, product.id, piece && piece.id),
   };
 }
 
 /** Shareable customer catalogue for a shortlist. */
-function publicCatalogue(db, token) {
-  const s = settings(db);
+async function publicCatalogue(db, token) {
+  const s = await settings(db);
   if (!/^[A-Za-z0-9_-]{8,32}$/.test(String(token))) return null;
-  const sl = db.prepare('SELECT * FROM shortlists WHERE share_token = ? AND share_enabled = 1').get(token);
+  const sl = await db.one('SELECT * FROM shortlists WHERE share_token = $1 AND share_enabled = 1', [token]);
   if (!sl) return null;
-  const items = db.prepare('SELECT * FROM shortlist_items WHERE shortlist_id = ? ORDER BY id').all(sl.id).map((it) => {
-    const p = db.prepare('SELECT * FROM products WHERE id = ?').get(it.product_id);
-    const piece = it.piece_id ? db.prepare('SELECT * FROM pieces WHERE id = ?').get(it.piece_id) : null;
+  const items = [];
+  for (const it of await db.query('SELECT * FROM shortlist_items WHERE shortlist_id = $1 ORDER BY id', [sl.id])) {
+    const p = await db.one('SELECT * FROM products WHERE id = $1', [it.product_id]);
+    const piece = it.piece_id ? await db.one('SELECT * FROM pieces WHERE id = $1', [it.piece_id]) : null;
     const price = piece ? (piece.selling_price ?? p.selling_price) : p.selling_price;
-    return {
+    items.push({
       product: publicProductFields(p),
       piece_code: piece ? piece.piece_code : null,
       qty: it.qty, preferred_finish: it.pref_finish || null, preferred_dimensions: it.pref_dimensions || null,
       price: s.public_show_prices && sl.share_show_prices && p.public_show_price && price != null ? price : null,
-      photos: photosFor(db, p.id, piece && piece.id, true).slice(0, 4).map((ph) => ({ url: ph.url, caption: ph.caption || null })),
-      videos: publicVideos(db, p.id, piece && piece.id),
-    };
-  });
+      photos: (await publicPhotos(db, p.id, piece && piece.id)).slice(0, 4).map((ph) => ({ url: ph.url, caption: ph.caption })),
+      videos: await publicVideos(db, p.id, piece && piece.id),
+    });
+  }
   return {
     business_name: s.business_name, showroom_contact: s.showroom_contact, currency: s.currency,
     title: sl.customer_name ? `Selection for ${sl.customer_name.split(' ')[0]}` : 'Your selection', items,

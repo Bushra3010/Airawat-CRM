@@ -12,14 +12,34 @@ A mobile-first staff app for Airawat Handicraft's showroom, warehouse and branch
 - **Customer QR page** (`/p/<token>`) and **shareable shortlist catalogue** (`/c/<token>`): public, whitelisted fields only.
 - **Customer shortlists**: compare items, create a quotation from a shortlist, confirm it as an order (this re-checks availability and reserves all-or-nothing), and share manually on WhatsApp.
 
-## Run it
+## Run it locally
 
 ```bash
 npm install
-npm start            # http://localhost:3000 — creates data/airawat.db with demo data on first run
-npm run seed         # wipe and reload demo data
-npm test             # verification suite
+npm start            # http://localhost:3000 — without DATABASE_URL it runs a private local Postgres in data/pg
+npm test             # verification suite (starts its own throwaway Postgres)
 ```
+
+## Deploy: Netlify + Supabase
+
+The app is stateless: stock, ledger, sessions and settings live in Supabase Postgres, product photos in a
+public Supabase Storage bucket, the staff app is served by Netlify's CDN and the API runs as one Netlify Function.
+
+1. **Supabase**: create a project. Collect three values (keep them private):
+   - `DATABASE_URL`: Project Settings → Database → Connection string → **Transaction pooler** (port 6543)
+   - `SUPABASE_URL`: Project Settings → API → Project URL
+   - `SUPABASE_SERVICE_ROLE_KEY`: Project Settings → API → `service_role` key (server only)
+2. **Set up the database** from this folder: put those values in `.env` (see `.env.example`), then run
+   `npm run db:setup`. It creates the tables, turns on row-level security so Supabase's public REST API
+   can't read them, creates the `product-photos` bucket, and loads demo data only if the database is empty.
+   `npm run db:reset` wipes everything and reloads demo data.
+3. **Netlify**: `netlify login`, then `netlify init` (or link an existing site), and add the same three
+   variables under Site configuration → Environment variables (Functions scope).
+4. `netlify deploy --build --prod`.
+5. In the app, set **Settings → Public base URL** to the Netlify address (or your custom domain) before printing QR labels.
+
+Netlify's HTTPS certificate works on every phone, so the local certificate below is only needed for running on the shop LAN.
+Limits on Netlify: one label batch is capped at 600 labels (function time limit), and photo uploads at 3.5 MB (the app resizes photos first).
 
 The demo staff logins (admin, manager, sales, storekeeper, plus a second sales login) are listed at the top of `src/seed.js`. **Change or remove them before real use.**
 
@@ -48,7 +68,7 @@ The demo staff logins (admin, manager, sales, storekeeper, plus a second sales l
 
 - **Stable identifiers.** Product codes (`AHP-000001`), piece codes (`AHU-000001`) and customer QR tokens are issued once and can't be edited. Renaming, repricing or moving an item never invalidates a printed label. Internal codes contain letters, so they can't be mistaken for GS1/EAN retail barcodes.
 - **Manufacturer barcodes** are optional. They're checked for duplicates across all products and pieces, and EAN/UPC check digits are validated.
-- **Stopping double reservations.** A piece is reserved with a conditional update inside an IMMEDIATE transaction. A unique index also allows only one active reservation per piece, so two staff, or two server processes, can't both reserve it.
+- **Stopping double reservations.** Each stock change locks the piece or product row (`SELECT … FOR UPDATE`) inside a Postgres transaction, and a partial unique index allows only one active reservation per piece. Tests fire simultaneous reservations from two separate connection pools (like two Netlify instances): exactly one wins, and SKU stock is never oversold.
 - **Saleable quantity** = sellable + display-released-for-sale − active reservations. Damaged and display-only stock is never saleable.
 - **Public pages** are built only from explicit field whitelists (`src/public.js`) and use their own routes and CSP. They never call the internal API. They can be turned off globally, per product, or per piece. Customers see your configured availability wording, never quantities or locations.
 - **QR reliability.** Every QR code is test-decoded with ZXing (the decoder the phone scanner falls back to) at several module sizes. If one fails, a different QR mask pattern is used. A small share of valid codes otherwise fail in ZXing.
@@ -56,7 +76,8 @@ The demo staff logins (admin, manager, sales, storekeeper, plus a second sales l
 ## Layout
 
 ```
-src/db.js          schema (SQLite)            src/inventory.js  availability, reservations, movements, ledger
+src/db.js          Postgres schema + pool     src/inventory.js  availability, reservations, movements, ledger
+src/storage.js     photos → Supabase Storage  netlify/functions/api.js  serverless entry; netlify.toml routes
 src/catalog.js     search, scan, detail, videos, alternatives
 src/labels.js      Code 128/QR layout, PDF, ZPL, print-size checks
 src/public.js      customer QR page + shared catalogue (whitelisted)

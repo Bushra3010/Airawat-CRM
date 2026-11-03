@@ -24,15 +24,15 @@ test.after(() => ctx.close());
 
 const P = () => ctx.ids.products;
 const L = () => ctx.ids.locations;
-const ledgerCount = () => ctx.db.prepare('SELECT COUNT(*) n FROM stock_ledger').get().n;
+const ledgerCount = async () => (await ctx.db.one('SELECT COUNT(*)::int n FROM stock_ledger')).n;
 const avail = (id) => inv.productAvailability(ctx.db, id);
 
 // ---------------------------------------------------------------- scanning
 test('scanning opens the correct product or exact piece', async () => {
   const db = ctx.db;
-  const ganesha = db.prepare('SELECT * FROM products WHERE id = ?').get(P().ganesha);
-  const piece = db.prepare('SELECT * FROM pieces WHERE id = ?').get(ctx.ids.hutchPieces[2].id);
-  const before = ledgerCount();
+  const ganesha = (await db.one('SELECT * FROM products WHERE id = $1', [P().ganesha]));
+  const piece = (await db.one('SELECT * FROM pieces WHERE id = $1', [ctx.ids.hutchPieces[2].id]));
+  const before = await ledgerCount();
   const cases = [
     [ganesha.internal_code, { type: 'product', product_id: ganesha.id, matched: 'internal_code' }],
     [ganesha.sku, { type: 'product', product_id: ganesha.id, matched: 'sku' }],
@@ -53,65 +53,65 @@ test('scanning opens the correct product or exact piece', async () => {
     assert.equal(r.body.piece_id, pc.id);
   }
   assert.equal((await sales.get('/scan?code=NOPE-123')).status, 404);
-  assert.equal(ledgerCount(), before, 'scanning must never write to the stock ledger');
+  assert.equal(await ledgerCount(), before, 'scanning must never write to the stock ledger');
 });
 
 test('stock movements require explicit confirmation', async () => {
-  const before = ledgerCount();
-  const a = avail(P().ganesha).totals.available;
+  const before = await ledgerCount();
+  const a = (await avail(P().ganesha)).totals.available;
   const r = await store.post('/stock/dispatch', { product_id: P().ganesha, location_id: L().show, qty: 1 });
   assert.equal(r.status, 400);
   assert.equal(r.body.needs_confirmation, true);
   assert.equal((await sales.post('/stock/reserve', { piece_id: ctx.ids.hutchPieces[0].id })).status, 400);
-  assert.equal(avail(P().ganesha).totals.available, a);
-  assert.equal(ledgerCount(), before);
+  assert.equal((await avail(P().ganesha)).totals.available, a);
+  assert.equal(await ledgerCount(), before);
   // permissions: sales cannot dispatch even with confirmation
   assert.equal((await sales.post('/stock/dispatch', { product_id: P().ganesha, location_id: L().show, qty: 1, confirm: true })).status, 403);
 });
 
 // ---------------------------------------------------------------- saleable availability
-test('reserved, damaged and display-only stock is excluded from saleable availability', () => {
-  const g = avail(P().ganesha);          // 12 showroom + 20 warehouse sellable, 1 damaged
+test('reserved, damaged and display-only stock is excluded from saleable availability', async () => {
+  const g = (await avail(P().ganesha));          // 12 showroom + 20 warehouse sellable, 1 damaged
   assert.equal(g.totals.available, 32);
   assert.equal(g.totals.damaged, 1);
   assert.equal(g.totals.physical, 33);
 
-  const h = avail(P().hutch);            // 5 cabinets: 2 free, 1 reserved, 1 damaged, 1 display
+  const h = (await avail(P().hutch));            // 5 cabinets: 2 free, 1 reserved, 1 damaged, 1 display
   assert.deepEqual([h.totals.physical, h.totals.available, h.totals.reserved, h.totals.damaged, h.totals.display], [5, 2, 1, 1, 1]);
   const show = h.byLocation.find((l) => l.type === 'showroom');
   assert.equal(show.available, 0, 'showroom display cabinet is not saleable');
 
-  const j = avail(P().jhula);            // single antique piece on display only
+  const j = (await avail(P().jhula));            // single antique piece on display only
   assert.equal(j.status, 'display_only');
   assert.equal(j.totals.available, 0);
 
-  const sofa = avail(P().sofa);          // only a damaged unit
+  const sofa = (await avail(P().sofa));          // only a damaged unit
   assert.equal(sofa.status, 'damaged');
   assert.equal(sofa.totals.available, 0);
   assert.ok(sofa.expected && sofa.expected.date, 'incoming production gives an expected date');
 
-  const tv = avail(P().tv);              // display piece explicitly released for sale counts
+  const tv = (await avail(P().tv));              // display piece explicitly released for sale counts
   assert.equal(tv.totals.available, 3);
 
-  assert.equal(avail(P().bed).status, 'made_to_order');
-  assert.equal(avail(P().chest).status, 'out_of_stock');
-  assert.ok(avail(P().chest).expected.date);
+  assert.equal((await avail(P().bed)).status, 'made_to_order');
+  assert.equal((await avail(P().chest)).status, 'out_of_stock');
+  assert.ok((await avail(P().chest)).expected.date);
 });
 
 test('a display piece can only be reserved once explicitly released for sale', async () => {
-  const jhula = ctx.db.prepare('SELECT * FROM pieces WHERE product_id = ?').get(P().jhula);
+  const jhula = (await ctx.db.one('SELECT * FROM pieces WHERE product_id = $1', [P().jhula]));
   let r = await sales.post('/stock/reserve', { piece_id: jhula.id, confirm: true });
   assert.equal(r.status, 409);
   r = await manager.post('/stock/condition', { piece_id: jhula.id, to_condition: 'display_sale', confirm: true });
   assert.equal(r.status, 200);
-  assert.equal(avail(P().jhula).status, 'available_now');
+  assert.equal((await avail(P().jhula)).status, 'available_now');
   r = await sales.post('/stock/reserve', { piece_id: jhula.id, customer_name: 'Test', confirm: true });
   assert.equal(r.status, 200);
   await sales.post('/stock/release', { reservation_id: r.body.reservation_id, confirm: true });
-  const after = ctx.db.prepare('SELECT status, display_for_sale FROM pieces WHERE id = ?').get(jhula.id);
+  const after = (await ctx.db.one('SELECT status, display_for_sale FROM pieces WHERE id = $1', [jhula.id]));
   assert.deepEqual({ ...after }, { status: 'display', display_for_sale: 1 }, 'release restores the display-for-sale state');
   await manager.post('/stock/condition', { piece_id: jhula.id, to_condition: 'display', confirm: true });
-  assert.equal(avail(P().jhula).status, 'display_only');
+  assert.equal((await avail(P().jhula)).status, 'display_only');
 });
 
 // ---------------------------------------------------------------- concurrency
@@ -124,92 +124,107 @@ test('two staff members cannot reserve the same unique piece', async () => {
   const codes = results.map((r) => r.status).sort();
   assert.deepEqual(codes, [200, 409]);
   assert.match(results.find((r) => r.status === 409).body.error, /reserved/i);
-  assert.equal(ctx.db.prepare("SELECT COUNT(*) n FROM reservations WHERE piece_id = ? AND status = 'active'").get(piece.id).n, 1);
+  assert.equal((await ctx.db.one("SELECT COUNT(*)::int n FROM reservations WHERE piece_id = $1 AND status = 'active'", [piece.id])).n, 1);
   const winner = results.find((r) => r.status === 200).body.reservation_id;
   await sales.post('/stock/release', { reservation_id: winner, confirm: true });
 });
 
-test('reservation is safe across separate database connections (multi-process)', () => {
-  const a = open(ctx.file), b = open(ctx.file);
-  const piece = ctx.ids.hutchPieces[0];
-  const r1 = inv.reserve(a, { pieceId: piece.id, userId: 1, customerName: 'conn A' });
-  assert.throws(() => inv.reserve(b, { pieceId: piece.id, userId: 1, customerName: 'conn B' }), /reserved/);
-  // even a raw second active reservation row is rejected by the database
-  assert.throws(() => b.prepare("INSERT INTO reservations (product_id, piece_id, qty, status) VALUES (?, ?, 1, 'active')").run(P().hutch, piece.id), /UNIQUE/);
-  inv.releaseReservation(a, r1, 1);
-  a.close(); b.close();
+test('reservation is safe across separate database connections (multi-process)', async () => {
+  // Two independent connection pools, like two serverless function instances.
+  const a = open(ctx.url, { max: 5 }), b = open(ctx.url, { max: 5 });
+  try {
+    const piece = ctx.ids.hutchPieces[0];
+    const results = await Promise.allSettled(Array.from({ length: 8 }, (_, i) => inv.reserve(i % 2 ? a : b, { pieceId: piece.id, userId: 1, customerName: `conn ${i}` })));
+    const ok = results.filter((r) => r.status === 'fulfilled');
+    assert.equal(ok.length, 1, 'exactly one of eight simultaneous reservations succeeds');
+    assert.ok(results.filter((r) => r.status === 'rejected').every((r) => /reserved/.test(r.reason.message)));
+    // even a raw second active reservation row is rejected by the database
+    await assert.rejects(b.query("INSERT INTO reservations (product_id, piece_id, qty, status) VALUES ($1, $2, 1, 'active')", [P().hutch, piece.id]), /ux_res_piece_active|duplicate key/);
+    await inv.releaseReservation(a, ok[0].value, 1);
+
+    // SKU stock: concurrent reservations never oversell (12 sellable at the showroom)
+    const g = P().ganesha;
+    const before = (await avail(g)).byLocation.find((l) => l.location_id === L().show).available;
+    const many = await Promise.allSettled(Array.from({ length: 10 }, (_, i) => inv.reserve(i % 2 ? a : b, { productId: g, locationId: L().show, qty: 3, userId: 1 })));
+    const won = many.filter((r) => r.status === 'fulfilled');
+    assert.equal(won.length, Math.floor(before / 3));
+    assert.equal((await avail(g)).byLocation.find((l) => l.location_id === L().show).available, before - won.length * 3);
+    for (const r of won) await inv.releaseReservation(a, r.value, 1);
+  } finally {
+    await a.close(); await b.close();
+  }
 });
 
 // ---------------------------------------------------------------- stock updates
 test('stock availability updates after reservation, transfer, dispatch, cancellation and inspected returns (SKU)', async () => {
   const id = P().ganesha;
-  const showAvail = () => avail(id).byLocation.find((l) => l.location_id === L().show).available;
-  const ledger0 = ledgerCount();
+  const showAvail = async () => (await avail(id)).byLocation.find((l) => l.location_id === L().show).available;
+  const ledger0 = await ledgerCount();
 
   let r = await sales.post('/stock/reserve', { product_id: id, location_id: L().show, qty: 5, customer_name: 'Kulkarni', confirm: true });
   assert.equal(r.status, 200);
   const res1 = r.body.reservation_id;
-  assert.equal(avail(id).totals.available, 27);
-  assert.equal(avail(id).totals.reserved, 5);
-  assert.equal(showAvail(), 7);
+  assert.equal((await avail(id)).totals.available, 27);
+  assert.equal((await avail(id)).totals.reserved, 5);
+  assert.equal((await showAvail()), 7);
 
   r = await store.post('/stock/transfer', { product_id: id, from_location_id: L().show, to_location_id: L().wh, qty: 8, condition: 'sellable', confirm: true });
   assert.equal(r.status, 409, 'cannot move reserved units');
   r = await store.post('/stock/transfer', { product_id: id, from_location_id: L().show, to_location_id: L().br, qty: 3, condition: 'sellable', rack: 'B-1', confirm: true });
   assert.equal(r.status, 200);
-  assert.equal(showAvail(), 4);
-  assert.equal(avail(id).byLocation.find((l) => l.location_id === L().br).available, 3);
-  assert.equal(avail(id).totals.available, 27, 'transfer moves stock without changing total');
+  assert.equal((await showAvail()), 4);
+  assert.equal((await avail(id)).byLocation.find((l) => l.location_id === L().br).available, 3);
+  assert.equal((await avail(id)).totals.available, 27, 'transfer moves stock without changing total');
 
   r = await store.post('/stock/dispatch', { reservation_id: res1, reference: 'INV-1', confirm: true });
   assert.equal(r.status, 200);
-  assert.equal(avail(id).totals.reserved, 0);
-  assert.equal(avail(id).totals.physical, 33 - 5);
-  assert.equal(avail(id).totals.available, 27);
+  assert.equal((await avail(id)).totals.reserved, 0);
+  assert.equal((await avail(id)).totals.physical, 33 - 5);
+  assert.equal((await avail(id)).totals.available, 27);
 
   r = await sales.post('/stock/reserve', { product_id: id, location_id: L().show, qty: 2, confirm: true });
-  assert.equal(avail(id).totals.available, 25);
+  assert.equal((await avail(id)).totals.available, 25);
   r = await sales.post('/stock/release', { reservation_id: r.body.reservation_id, reason: 'customer cancelled', confirm: true });
   assert.equal(r.status, 200);
-  assert.equal(avail(id).totals.available, 27, 'cancellation returns stock to available');
+  assert.equal((await avail(id)).totals.available, 27, 'cancellation returns stock to available');
 
   r = await store.post('/stock/return', { product_id: id, location_id: L().show, qty: 1, result: 'sellable', confirm: true });
-  assert.equal(avail(id).totals.available, 28);
+  assert.equal((await avail(id)).totals.available, 28);
   r = await store.post('/stock/return', { product_id: id, location_id: L().show, qty: 1, result: 'damaged', confirm: true });
-  assert.equal(avail(id).totals.available, 28, 'damaged return is not saleable');
-  assert.equal(avail(id).totals.damaged, 2);
+  assert.equal((await avail(id)).totals.available, 28, 'damaged return is not saleable');
+  assert.equal((await avail(id)).totals.damaged, 2);
 
   r = await store.post('/stock/count', { product_id: id, location_id: L().wh, condition: 'sellable', counted_qty: 19, confirm: true });
   assert.equal(r.body.delta, -1);
-  assert.equal(avail(id).totals.available, 27);
+  assert.equal((await avail(id)).totals.available, 27);
 
-  const moves = ctx.db.prepare('SELECT movement, qty FROM stock_ledger WHERE id > ? ORDER BY id').all(ledger0).map((m) => m.movement);
+  const moves = (await ctx.db.query('SELECT movement, qty FROM stock_ledger WHERE id > $1 ORDER BY id', [ledger0])).map((m) => m.movement);
   assert.deepEqual(moves, ['reserve', 'transfer', 'dispatch', 'reserve', 'release', 'return', 'return', 'count_adjust']);
 });
 
 test('selling or reserving a particular piece updates exactly that piece (piece flow)', async () => {
   const [p0, p1, p2] = ctx.ids.hutchPieces;
-  const state = (id) => ctx.db.prepare('SELECT status, location_id FROM pieces WHERE id = ?').get(id);
-  const before1 = state(p1.id);
+  const state = async (id) => (await ctx.db.one('SELECT status, location_id FROM pieces WHERE id = $1', [id]));
+  const before1 = (await state(p1.id));
   let r = await sales.post('/stock/reserve', { piece_id: p0.id, confirm: true });
-  assert.equal(state(p0.id).status, 'reserved');
-  assert.deepEqual(state(p1.id), before1, 'sibling piece untouched');
-  assert.equal(avail(P().hutch).totals.available, 1);
+  assert.equal((await state(p0.id)).status, 'reserved');
+  assert.deepEqual((await state(p1.id)), before1, 'sibling piece untouched');
+  assert.equal((await avail(P().hutch)).totals.available, 1);
 
   r = await store.post('/stock/transfer', { piece_id: p0.id, to_location_id: L().show, rack: 'Zone B · Wall 3', confirm: true });
   assert.equal(r.status, 200);
-  assert.equal(state(p0.id).location_id, L().show);
-  assert.equal(state(p0.id).status, 'reserved', 'still reserved after transfer');
+  assert.equal((await state(p0.id)).location_id, L().show);
+  assert.equal((await state(p0.id)).status, 'reserved', 'still reserved after transfer');
 
   r = await store.post('/stock/dispatch', { piece_id: p0.id, reference: 'INV-9', confirm: true });
   assert.equal(r.status, 200);
-  assert.equal(state(p0.id).status, 'sold');
-  assert.equal(ctx.db.prepare("SELECT status FROM reservations WHERE piece_id = ? ORDER BY id DESC").get(p0.id).status, 'fulfilled');
-  assert.equal(avail(P().hutch).totals.physical, 4);
+  assert.equal((await state(p0.id)).status, 'sold');
+  assert.equal((await ctx.db.one("SELECT status FROM reservations WHERE piece_id = $1 ORDER BY id DESC", [p0.id])).status, 'fulfilled');
+  assert.equal((await avail(P().hutch)).totals.physical, 4);
 
   r = await store.post('/stock/return', { piece_id: p0.id, location_id: L().wh, result: 'sellable', rack: 'WH-A3', confirm: true });
-  assert.equal(state(p0.id).status, 'available');
-  assert.equal(avail(P().hutch).totals.available, 2);
+  assert.equal((await state(p0.id)).status, 'available');
+  assert.equal((await avail(P().hutch)).totals.available, 2);
 
   // Dispatching an unreserved piece that is not saleable is refused
   assert.equal((await store.post('/stock/dispatch', { piece_id: ctx.ids.hutchPieces[3].id, confirm: true })).status, 409, 'damaged piece');
@@ -227,22 +242,22 @@ test('confirming an order re-checks availability and reserves all-or-nothing', a
   ] })).body.id;
   let r = await sales.post(`/quotations/${q}/confirm`, { confirm: true });
   assert.equal(r.status, 409);
-  assert.equal(avail(P().shelf).totals.reserved, 0, 'nothing reserved when one line fails');
+  assert.equal((await avail(P().shelf)).totals.reserved, 0, 'nothing reserved when one line fails');
   const items = (await sales.get('/quotations/' + q)).body.items;
   assert.equal((await sales.del('/quotation-items/' + items[1].id)).status, 200);
   r = await sales.post(`/quotations/${q}/confirm`, { confirm: true });
   assert.equal(r.status, 200);
-  assert.equal(avail(P().shelf).totals.reserved, 1);
+  assert.equal((await avail(P().shelf)).totals.reserved, 1);
   r = await sales.post(`/quotations/${q}/cancel`, { confirm: true });
-  assert.equal(avail(P().shelf).totals.reserved, 0, 'cancelling the order releases its stock');
+  assert.equal((await avail(P().shelf)).totals.reserved, 0, 'cancelling the order releases its stock');
 });
 
 test('a shortlist never reserves stock and can become a quotation', async () => {
   const s = (await sales.post('/shortlists', { customer_name: 'Shah' })).body.id;
-  const a0 = avail(P().diningHoney).totals.available;
-  await sales.post(`/shortlists/${s}/items`, { code: ctx.db.prepare('SELECT internal_code FROM products WHERE id = ?').get(P().diningHoney).internal_code, pref_finish: 'Honey', qty: 2 });
+  const a0 = (await avail(P().diningHoney)).totals.available;
+  await sales.post(`/shortlists/${s}/items`, { code: (await ctx.db.one('SELECT internal_code FROM products WHERE id = $1', [P().diningHoney])).internal_code, pref_finish: 'Honey', qty: 2 });
   await sales.post(`/shortlists/${s}/items`, { code: ctx.ids.hutchPieces[1].piece_code });
-  assert.equal(avail(P().diningHoney).totals.available, a0);
+  assert.equal((await avail(P().diningHoney)).totals.available, a0);
   const list = (await sales.get('/shortlists/' + s)).body;
   assert.equal(list.items.length, 2);
   assert.equal(list.items[1].status, 'reserved', 'current availability is shown');
@@ -295,10 +310,10 @@ test('YouTube URLs are validated and unavailable videos handled', async () => {
   assert.equal(r.status, 200);
   const vid = r.body.id;
   await sales.post(`/videos/${vid}/player-error`, { code: 150 });
-  let pubData = await fetch(`${ctx.base}/api/public/p/${ctx.db.prepare('SELECT public_token FROM products WHERE id = ?').get(P().shelf).public_token}`).then((x) => x.json());
+  let pubData = await fetch(`${ctx.base}/api/public/p/${(await ctx.db.one('SELECT public_token FROM products WHERE id = $1', [P().shelf])).public_token}`).then((x) => x.json());
   assert.equal(pubData.videos[0].embeddable, false, 'embedding-disabled video falls back to a YouTube link');
   await sales.post(`/videos/${vid}/player-error`, { code: 100 });
-  pubData = await fetch(`${ctx.base}/api/public/p/${ctx.db.prepare('SELECT public_token FROM products WHERE id = ?').get(P().shelf).public_token}`).then((x) => x.json());
+  pubData = await fetch(`${ctx.base}/api/public/p/${(await ctx.db.one('SELECT public_token FROM products WHERE id = $1', [P().shelf])).public_token}`).then((x) => x.json());
   assert.equal(pubData.videos.length, 0, 'removed/private videos are hidden from customers');
 });
 
@@ -312,8 +327,8 @@ function walkKeys(obj, out = []) {
 
 test('customer QR pages expose only approved public information', async () => {
   const db = ctx.db;
-  const hutch = db.prepare('SELECT * FROM products WHERE id = ?').get(P().hutch);
-  const damagedPiece = db.prepare('SELECT * FROM pieces WHERE id = ?').get(ctx.ids.hutchPieces[2].id);
+  const hutch = (await db.one('SELECT * FROM products WHERE id = $1', [P().hutch]));
+  const damagedPiece = (await db.one('SELECT * FROM pieces WHERE id = $1', [ctx.ids.hutchPieces[2].id]));
   const secrets = ['41000', '41,000', 'Jodhpur Woodcraft', 'Negotiable', 'Mehta', 'WH-A3', 'WH-A4', 'Scratch detail', 'Assembly notes'];
 
   for (const token of [hutch.public_token, damagedPiece.public_token]) {
@@ -328,7 +343,7 @@ test('customer QR pages expose only approved public information', async () => {
   const pieceJson = await fetch(`${ctx.base}/api/public/p/${damagedPiece.public_token}`).then((r) => r.json());
   assert.equal(pieceJson.photos.some((p) => p.caption === 'Scratch detail'), false, 'unapproved photo hidden');
   assert.equal(pieceJson.price, 61000, 'piece-specific selling price');
-  const displayJson = await fetch(`${ctx.base}/api/public/p/${db.prepare('SELECT public_token FROM pieces WHERE id = ?').get(ctx.ids.hutchPieces[4].id).public_token}`).then((r) => r.json());
+  const displayJson = await fetch(`${ctx.base}/api/public/p/${(await db.one('SELECT public_token FROM pieces WHERE id = $1', [ctx.ids.hutchPieces[4].id])).public_token}`).then((r) => r.json());
   assert.equal(displayJson.price, null, 'display-only piece is not presented as saleable');
   assert.match(displayJson.availability_text, /display/i);
   assert.ok(!/\d/.test(pieceJson.availability_text), 'availability is wording only, no quantities');
@@ -363,7 +378,7 @@ test('customer QR pages expose only approved public information', async () => {
 test('shared customer catalogue is off by default and shows only approved fields', async () => {
   const s = (await sales.post('/shortlists', { customer_name: 'Rao Family', customer_phone: '9800000000' })).body.id;
   await sales.post(`/shortlists/${s}/items`, { product_id: P().hutch, piece_id: ctx.ids.hutchPieces[0].id });
-  const token = ctx.db.prepare('SELECT share_token FROM shortlists WHERE id = ?').get(s).share_token;
+  const token = (await ctx.db.one('SELECT share_token FROM shortlists WHERE id = $1', [s])).share_token;
   assert.equal((await fetch(`${ctx.base}/c/${token}`)).status, 404);
   await sales.patch('/shortlists/' + s, { share_enabled: true });
   const json = await fetch(`${ctx.base}/api/public/c/${token}`).then((r) => r.json());
@@ -378,14 +393,14 @@ test('shared customer catalogue is off by default and shows only approved fields
 // ---------------------------------------------------------------- codes
 test('internal codes are stable and manufacturer barcodes are validated for duplicates', async () => {
   const id = P().desk;
-  const before = ctx.db.prepare('SELECT internal_code, public_token FROM products WHERE id = ?').get(id);
+  const before = (await ctx.db.one('SELECT internal_code, public_token FROM products WHERE id = $1', [id]));
   await manager.put('/products/' + id, { name: 'Study Table Renamed', selling_price: 27000, internal_code: 'HACK', public_token: 'HACKHACKHACK' });
   await store.post('/stock/transfer', { product_id: id, from_location_id: L().br, to_location_id: L().show, qty: 1, confirm: true });
-  const after = ctx.db.prepare('SELECT internal_code, public_token, name FROM products WHERE id = ?').get(id);
+  const after = (await ctx.db.one('SELECT internal_code, public_token, name FROM products WHERE id = $1', [id]));
   assert.equal(after.name, 'Study Table Renamed');
   assert.deepEqual([after.internal_code, after.public_token], [before.internal_code, before.public_token]);
 
-  const ganeshaEan = ctx.db.prepare('SELECT mfr_barcode FROM products WHERE id = ?').get(P().ganesha).mfr_barcode;
+  const ganeshaEan = (await ctx.db.one('SELECT mfr_barcode FROM products WHERE id = $1', [P().ganesha])).mfr_barcode;
   let r = await manager.put('/products/' + id, { mfr_barcode: ganeshaEan });
   assert.equal(r.status, 409, 'duplicate manufacturer barcode');
   r = await manager.put('/pieces/' + ctx.ids.hutchPieces[1].id, { mfr_barcode: ganeshaEan });
@@ -402,7 +417,7 @@ test('internal codes are stable and manufacturer barcodes are validated for dupl
   assert.equal((await manager.post('/products', { name: 'Dup', sku: 'AH-STL-1' })).status, 409);
 });
 
-test('Code 128 encoder produces correct check characters', () => {
+test('Code 128 encoder produces correct check characters', async () => {
   // Known value: "AHP-000001" → Start B, A H P - , Code C, 00 00 01, checksum, stop
   const v = code128Values('AHP-000001');
   assert.deepEqual(v.slice(0, 9), [104, 33, 40, 48, 13, 99, 0, 0, 1]);
@@ -441,10 +456,10 @@ function decode({ px, W, H }, format) {
 
 test('bulk-generated labels scan correctly at the intended printed size', async () => {
   const db = ctx.db;
-  const tpls = db.prepare('SELECT * FROM label_templates').all();
+  const tpls = (await db.query('SELECT * FROM label_templates'));
   const items = [
-    ...db.prepare('SELECT id FROM products').all().map((p) => ({ type: 'product', id: p.id })),
-    ...db.prepare('SELECT id FROM pieces').all().map((p) => ({ type: 'piece', id: p.id })),
+    ...(await db.query('SELECT id FROM products ORDER BY id')).map((p) => ({ type: 'product', id: p.id })),
+    ...(await db.query('SELECT id FROM pieces ORDER BY id')).map((p) => ({ type: 'piece', id: p.id })),
   ];
   // Which code modes must print without size warnings on each stock label size
   const mustBeClean = (t) => t.width_mm >= 60 ? ['both', 'barcode', 'qr'] : t.width_mm >= 50 ? ['barcode', 'qr'] : ['qr'];
@@ -453,7 +468,7 @@ test('bulk-generated labels scan correctly at the intended printed size', async 
     for (const content of ['both', 'barcode', 'qr']) {
       const opts = { content, show_price: true, show_specs: true };
       for (const it of items) {
-        const data = labels.labelData(db, it, opts, 'https://showroom.example.test', 'Airawat Handicraft');
+        const data = await labels.labelData(db, it, opts, 'https://showroom.example.test', 'Airawat Handicraft');
         const lab = labels.layoutLabel(data, tpl, opts);
         const clean = lab.checks.warnings.length === 0;
         if (mustBeClean(tpl).includes(content)) assert.ok(clean, `${tpl.name} [${content}]: ${lab.checks.warnings.join('; ')}`);
@@ -476,16 +491,16 @@ test('bulk-generated labels scan correctly at the intended printed size', async 
   assert.ok(decoded > 200, `decoded ${decoded}`);
   // the smallest sheet warns instead of silently printing an unreadable barcode
   const tiny = tpls.find((t) => t.width_mm < 40);
-  const w = labels.layoutLabel(labels.labelData(db, items[0], {}, 'https://x.test', 'A'), tiny, { content: 'both' }).checks.warnings;
+  const w = labels.layoutLabel(await labels.labelData(db, items[0], {}, 'https://x.test', 'A'), tiny, { content: 'both' }).checks.warnings;
   assert.ok(w.some((x) => /Barcode bars/.test(x)));
 
   // manufacturer barcode option prints the existing EAN
-  const g = labels.labelData(db, { type: 'product', id: P().ganesha }, { use_mfr: true }, 'https://x.test', 'A');
+  const g = await labels.labelData(db, { type: 'product', id: P().ganesha }, { use_mfr: true }, 'https://x.test', 'A');
   const t = tpls.find((x) => x.layout === 'thermal');
   assert.equal(decode(rasterise(labels.layoutLabel(g, t, { content: 'barcode' }), t.dpi, 'barcode'), BarcodeFormat.CODE_128), '8901234567890');
 });
 
-test('QR codes that trip ZXing are regenerated with a readable mask', () => {
+test('QR codes that trip ZXing are regenerated with a readable mask', async () => {
   // Valid codes (jsQR reads them) that ZXing's reader rejects with the default mask
   for (const url of ['https://showroom.example.test/p/G5JNe4SxfZBg', 'https://showroom.example.test/p/XBRYOH9AmKam']) {
     const data = { business: 'A', name: 'X', sku: 'S', barcode: 'AHP-000001', qr: url };
@@ -497,7 +512,7 @@ test('QR codes that trip ZXing are regenerated with a readable mask', () => {
 });
 
 test('label PDFs and ZPL never contain cost, margin or vendor', async () => {
-  const tpl = ctx.db.prepare("SELECT * FROM label_templates WHERE layout = 'a4' ORDER BY width_mm DESC").get();
+  const tpl = (await ctx.db.one("SELECT * FROM label_templates WHERE layout = 'a4' ORDER BY width_mm DESC"));
   const items = [{ type: 'product_pieces', id: P().hutch }, { type: 'product', id: P().ganesha, copies: 30 }];
   const r = await sales.post('/labels/preview', { template_id: tpl.id, items, show_price: true, show_specs: true, content: 'both' });
   assert.equal(r.status, 200);
@@ -506,7 +521,7 @@ test('label PDFs and ZPL never contain cost, margin or vendor', async () => {
   for (const l of r.body.labels) assert.deepEqual(Object.keys(l).filter((k) => /cost|margin|vendor/i.test(k)), []);
 
   const datas = [];
-  for (const pc of ctx.db.prepare('SELECT id FROM pieces WHERE product_id = ?').all(P().hutch)) datas.push(labels.labelData(ctx.db, { type: 'piece', id: pc.id }, { show_price: true, show_specs: true }, 'https://x.test', 'Airawat Handicraft'));
+  for (const pc of (await ctx.db.query('SELECT id FROM pieces WHERE product_id = $1', [P().hutch]))) datas.push(await labels.labelData(ctx.db, { type: 'piece', id: pc.id }, { show_price: true, show_specs: true }, 'https://x.test', 'Airawat Handicraft'));
   const pdf = (await labels.renderPdf(datas.map((d) => labels.layoutLabel(d, tpl, {})), tpl, { compress: false })).toString('latin1');
   assert.ok(pdf.startsWith('%PDF'));
   // pdfkit writes text as hex glyph strings (split at kerning pairs): decode and join them
@@ -515,7 +530,7 @@ test('label PDFs and ZPL never contain cost, margin or vendor', async () => {
   assert.ok(printed.includes('AIRAWAT HANDICRAFT') && printed.includes('AH-CAB-HUTCH'));
   assert.ok(!/41000|41,000|Jodhpur|Negotiable/.test(printed + pdf), 'cost/vendor not printed');
 
-  const thermal = ctx.db.prepare("SELECT * FROM label_templates WHERE layout = 'thermal'").get();
+  const thermal = (await ctx.db.one("SELECT * FROM label_templates WHERE layout = 'thermal'"));
   const zpl = await sales.post('/labels/zpl', { template_id: thermal.id, items: [{ type: 'product', id: P().ganesha, copies: 2 }], show_price: true });
   const z = zpl.body.toString();
   assert.equal((z.match(/\^XA/g) || []).length, 2);

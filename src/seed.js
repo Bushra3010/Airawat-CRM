@@ -11,7 +11,7 @@
  */
 const fs = require('fs');
 const path = require('path');
-const { open } = require('./db');
+const { open, migrate, TABLES } = require('./db');
 const { nextCode, newToken } = require('./codes');
 const { hashPassword } = require('./server');
 const { DEFAULT_TEMPLATES } = require('./labels');
@@ -44,136 +44,144 @@ function photoSvg(shape, bg, label) {
 
 const SAMPLE_VIDEO = 'https://www.youtube.com/watch?v=jNQXAC9IVRw'; // placeholder — replace with your product videos
 
-function seed(db, { photoDir } = {}) {
-  db.exec(`DELETE FROM sessions; DELETE FROM stock_ledger; DELETE FROM reservations; DELETE FROM quotation_items; DELETE FROM quotations;
-    DELETE FROM shortlist_items; DELETE FROM shortlists; DELETE FROM enquiries; DELETE FROM incoming; DELETE FROM videos; DELETE FROM photos;
-    DELETE FROM stock_balances; DELETE FROM pieces; DELETE FROM products; DELETE FROM locations; DELETE FROM users; DELETE FROM code_sequences;
-    DELETE FROM label_templates; DELETE FROM settings;`);
+async function seed(db, { photoDir } = {}) {
+  await db.query(`TRUNCATE ${TABLES.join(', ')} RESTART IDENTITY CASCADE`);
 
-  const set = db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)');
-  set.run('business_name', 'Airawat Handicraft');
-  set.run('public_pages_enabled', '1');
-  set.run('public_show_prices', '1');
-  set.run('public_show_expected_date', '0');
-  set.run('currency', 'INR');
-  set.run('showroom_contact', '+91 98229 97011');
+  for (const [k, v] of [['business_name', 'Airawat Handicraft'], ['public_pages_enabled', '1'], ['public_show_prices', '1'], ['public_show_expected_date', '0'],
+    ['currency', 'INR'], ['showroom_contact', '+91 98229 97011']]) await db.query('INSERT INTO settings (key, value) VALUES ($1, $2)', [k, v]);
 
-  const uIns = db.prepare('INSERT INTO users (username, name, role, pass_hash) VALUES (?, ?, ?, ?)');
   const users = {};
-  for (const [u, n, r, pw] of USERS) users[u] = Number(uIns.run(u, n, r, hashPassword(pw)).lastInsertRowid);
+  for (const [u, n, r, pw] of USERS) users[u] = (await db.one('INSERT INTO users (username, name, role, pass_hash) VALUES ($1, $2, $3, $4) RETURNING id', [u, n, r, hashPassword(pw)])).id;
 
-  const lIns = db.prepare('INSERT INTO locations (code, name, type) VALUES (?, ?, ?)');
-  const L = {
-    show: Number(lIns.run('SHR', 'Baner Showroom', 'showroom').lastInsertRowid),
-    wh: Number(lIns.run('WH1', 'Main Warehouse', 'warehouse').lastInsertRowid),
-    br: Number(lIns.run('BR2', 'Second Branch', 'branch').lastInsertRowid),
-  };
+  const loc = async (code, name, type) => (await db.one('INSERT INTO locations (code, name, type) VALUES ($1, $2, $3) RETURNING id', [code, name, type])).id;
+  const L = { show: await loc('SHR', 'Baner Showroom', 'showroom'), wh: await loc('WH1', 'Main Warehouse', 'warehouse'), br: await loc('BR2', 'Second Branch', 'branch') };
 
-  const tIns = db.prepare(`INSERT INTO label_templates (name, layout, width_mm, height_mm, cols, rows, margin_top_mm, margin_left_mm, gap_x_mm, gap_y_mm, dpi)
-    VALUES (@name, @layout, @width_mm, @height_mm, @cols, @rows, @margin_top_mm, @margin_left_mm, @gap_x_mm, @gap_y_mm, @dpi)`);
-  for (const t of DEFAULT_TEMPLATES) tIns.run({ cols: null, rows: null, margin_top_mm: 0, margin_left_mm: 0, gap_x_mm: 0, gap_y_mm: 0, ...t });
+  for (const t of DEFAULT_TEMPLATES) {
+    const r = { cols: null, rows: null, margin_top_mm: 0, margin_left_mm: 0, gap_x_mm: 0, gap_y_mm: 0, ...t };
+    await db.query(`INSERT INTO label_templates (name, layout, width_mm, height_mm, cols, rows, margin_top_mm, margin_left_mm, gap_x_mm, gap_y_mm, dpi)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`, [r.name, r.layout, r.width_mm, r.height_mm, r.cols, r.rows, r.margin_top_mm, r.margin_left_mm, r.gap_x_mm, r.gap_y_mm, r.dpi]);
+  }
 
   if (photoDir) fs.mkdirSync(photoDir, { recursive: true });
-  const pIns = (p) => {
+  const COLS = ['internal_code', 'public_token', 'sku', 'parent_id', 'variant_label', 'name', 'category', 'material', 'finish', 'length_cm', 'width_cm', 'height_cm',
+    'description', 'care', 'short_specs', 'selling_price', 'cost_price', 'vendor', 'internal_notes', 'tracking', 'made_to_order', 'lead_time_days', 'mfr_barcode'];
+  const pIns = async (p) => {
     const row = { parent_id: null, variant_label: null, category: null, material: null, finish: null, length_cm: null, width_cm: null, height_cm: null, description: null, care: null,
       short_specs: null, cost_price: null, vendor: null, internal_notes: null, tracking: 'sku', made_to_order: 0, lead_time_days: null, mfr_barcode: null, ...p,
-      internal_code: nextCode(db, 'AHP'), public_token: newToken() };
-    const id = Number(db.prepare(`INSERT INTO products (internal_code, public_token, sku, parent_id, variant_label, name, category, material, finish, length_cm, width_cm, height_cm,
-      description, care, short_specs, selling_price, cost_price, vendor, internal_notes, tracking, made_to_order, lead_time_days, mfr_barcode)
-      VALUES (@internal_code, @public_token, @sku, @parent_id, @variant_label, @name, @category, @material, @finish, @length_cm, @width_cm, @height_cm,
-      @description, @care, @short_specs, @selling_price, @cost_price, @vendor, @internal_notes, @tracking, @made_to_order, @lead_time_days, @mfr_barcode)`).run(row).lastInsertRowid);
-    if (p.shape && photoDir) {
+      internal_code: await nextCode(db, 'AHP'), public_token: newToken() };
+    const { id } = await db.one(`INSERT INTO products (${COLS.join(',')}) VALUES (${COLS.map((_, i) => `$${i + 1}`).join(',')}) RETURNING id`, COLS.map((c) => row[c]));
+    if (p.shape) {
       const file = `${p.sku.toLowerCase()}.svg`;
-      fs.writeFileSync(path.join(photoDir, file), photoSvg(p.shape, p.bg || '#f3ece2', p.name.replace(/&/g, 'and')));
-      db.prepare('INSERT INTO photos (product_id, url, is_public, sort) VALUES (?, ?, 1, 0)').run(id, `/seed-img/${file}`);
+      if (photoDir) fs.writeFileSync(path.join(photoDir, file), photoSvg(p.shape, p.bg || '#f3ece2', p.name.replace(/&/g, 'and')));
+      await db.query('INSERT INTO photos (product_id, url, is_public, sort) VALUES ($1, $2, 1, 0)', [id, `/seed-img/${file}`]);
     }
     return id;
   };
   const care = 'Dust with a soft dry cloth. Avoid direct sunlight and moisture. Polish with wax every 6 months.';
   const P = {};
-  P.hutch = pIns({ sku: 'AH-CAB-HUTCH', name: 'Sheesham Hutch Cabinet', category: 'Cabinets', material: 'Sheesham wood', finish: 'Honey', length_cm: 120, width_cm: 45, height_cm: 180,
+  P.hutch = await pIns({ sku: 'AH-CAB-HUTCH', name: 'Sheesham Hutch Cabinet', category: 'Cabinets', material: 'Sheesham wood', finish: 'Honey', length_cm: 120, width_cm: 45, height_cm: 180,
     description: 'Hand-carved solid Sheesham hutch with glass-panel upper doors and brass fittings. Each cabinet is finished by hand, so grain and tone vary slightly.',
     care, selling_price: 68000, cost_price: 41000, vendor: 'Jodhpur Woodcraft Works', internal_notes: 'Negotiable to 62k for showroom pieces', tracking: 'piece', shape: 'cabinet' });
-  P.dining = pIns({ sku: 'AH-DIN-6S', name: 'Sheesham 6 Seater Dining Set', category: 'Dining Room', material: 'Sheesham wood', length_cm: 180, width_cm: 90, height_cm: 76,
+  P.dining = await pIns({ sku: 'AH-DIN-6S', name: 'Sheesham 6 Seater Dining Set', category: 'Dining Room', material: 'Sheesham wood', length_cm: 180, width_cm: 90, height_cm: 76,
     description: 'Six-seater dining table with six cushioned chairs. Available in two finishes.', care, selling_price: 89000, cost_price: 54000, vendor: 'Jodhpur Woodcraft Works', shape: 'table', active: 1 });
-  P.diningHoney = pIns({ sku: 'AH-DIN-6S-HON', parent_id: P.dining, variant_label: 'Honey finish', name: 'Sheesham 6 Seater Dining Set', category: 'Dining Room', material: 'Sheesham wood', finish: 'Honey',
+  P.diningHoney = await pIns({ sku: 'AH-DIN-6S-HON', parent_id: P.dining, variant_label: 'Honey finish', name: 'Sheesham 6 Seater Dining Set', category: 'Dining Room', material: 'Sheesham wood', finish: 'Honey',
     length_cm: 180, width_cm: 90, height_cm: 76, care, selling_price: 89000, cost_price: 54000, vendor: 'Jodhpur Woodcraft Works', shape: 'table', bg: '#f6ead4' });
-  P.diningWalnut = pIns({ sku: 'AH-DIN-6S-WAL', parent_id: P.dining, variant_label: 'Walnut finish', name: 'Sheesham 6 Seater Dining Set', category: 'Dining Room', material: 'Sheesham wood', finish: 'Walnut',
+  P.diningWalnut = await pIns({ sku: 'AH-DIN-6S-WAL', parent_id: P.dining, variant_label: 'Walnut finish', name: 'Sheesham 6 Seater Dining Set', category: 'Dining Room', material: 'Sheesham wood', finish: 'Walnut',
     length_cm: 180, width_cm: 90, height_cm: 76, care, selling_price: 92000, cost_price: 55500, vendor: 'Jodhpur Woodcraft Works', shape: 'table', bg: '#e9dccb' });
-  P.bed = pIns({ sku: 'AH-BED-POSTER-K', name: 'Teak Poster Bed — King', category: 'Bedroom', material: 'Teak wood', finish: 'Natural teak', length_cm: 213, width_cm: 198, height_cm: 210,
+  P.bed = await pIns({ sku: 'AH-BED-POSTER-K', name: 'Teak Poster Bed — King', category: 'Bedroom', material: 'Teak wood', finish: 'Natural teak', length_cm: 213, width_cm: 198, height_cm: 210,
     description: 'Four-poster king bed in seasoned teak with carved headboard. Made to order in your choice of finish.', care, selling_price: 145000, cost_price: 88000, vendor: 'In-house workshop',
     made_to_order: 1, lead_time_days: 45, shape: 'bed' });
-  P.ganesha = pIns({ sku: 'AH-IDL-GANESH-M', name: 'Brass Ganesha Idol — Medium', category: 'Temple/Statues', material: 'Brass', finish: 'Antique gold', length_cm: 20, width_cm: 15, height_cm: 30,
+  P.ganesha = await pIns({ sku: 'AH-IDL-GANESH-M', name: 'Brass Ganesha Idol — Medium', category: 'Temple/Statues', material: 'Brass', finish: 'Antique gold', length_cm: 20, width_cm: 15, height_cm: 30,
     description: 'Solid brass Ganesha with antique gold finish.', care: 'Wipe with a dry cloth. Clean occasionally with a brass cleaner.', selling_price: 7800, cost_price: 4100, vendor: 'Moradabad Metal Arts',
     mfr_barcode: '8901234567890', shape: 'idol', bg: '#f7efdc', short_specs: 'Brass · 30 cm tall' });
-  P.jhula = pIns({ sku: 'AH-SWG-ANTQ', name: 'Antique Carved Jhula (Swing)', category: 'Showpieces', material: 'Teak wood', finish: 'Aged natural', length_cm: 150, width_cm: 60, height_cm: 200,
+  P.jhula = await pIns({ sku: 'AH-SWG-ANTQ', name: 'Antique Carved Jhula (Swing)', category: 'Showpieces', material: 'Teak wood', finish: 'Aged natural', length_cm: 150, width_cm: 60, height_cm: 200,
     description: 'Restored antique teak jhula with brass chains. One of a kind.', care, selling_price: 210000, cost_price: 120000, vendor: 'Private collection', tracking: 'piece', shape: 'swing' });
-  P.chest = pIns({ sku: 'AH-CHD-MANGO-4', name: 'Mango Wood Chest of 4 Drawers', category: 'Chest of Drawers', material: 'Mango wood', finish: 'Honey oak', length_cm: 80, width_cm: 45, height_cm: 95,
+  P.chest = await pIns({ sku: 'AH-CHD-MANGO-4', name: 'Mango Wood Chest of 4 Drawers', category: 'Chest of Drawers', material: 'Mango wood', finish: 'Honey oak', length_cm: 80, width_cm: 45, height_cm: 95,
     description: 'Four-drawer chest with ceramic knobs.', care, selling_price: 24500, cost_price: 14000, vendor: 'Saharanpur Craft Co.', shape: 'drawers' });
-  P.chest2 = pIns({ sku: 'AH-CHD-SHEE-5', name: 'Sheesham Chest of 5 Drawers', category: 'Chest of Drawers', material: 'Sheesham wood', finish: 'Honey', length_cm: 85, width_cm: 45, height_cm: 110,
+  P.chest2 = await pIns({ sku: 'AH-CHD-SHEE-5', name: 'Sheesham Chest of 5 Drawers', category: 'Chest of Drawers', material: 'Sheesham wood', finish: 'Honey', length_cm: 85, width_cm: 45, height_cm: 110,
     description: 'Five-drawer chest with brass handles.', care, selling_price: 27500, cost_price: 16500, vendor: 'Jodhpur Woodcraft Works', shape: 'drawers', bg: '#f6ead4' });
-  P.sofa = pIns({ sku: 'AH-SCB-3S', name: 'Sofa Cum Bed — 3 Seater', category: 'Sofa Cum Beds', material: 'Sheesham wood', finish: 'Walnut', length_cm: 195, width_cm: 85, height_cm: 85,
+  P.sofa = await pIns({ sku: 'AH-SCB-3S', name: 'Sofa Cum Bed — 3 Seater', category: 'Sofa Cum Beds', material: 'Sheesham wood', finish: 'Walnut', length_cm: 195, width_cm: 85, height_cm: 85,
     description: 'Pull-out sofa cum bed with upholstered cushions.', care, selling_price: 52000, cost_price: 31000, vendor: 'Pune Upholstery', shape: 'sofa' });
-  P.tv = pIns({ sku: 'AH-TVU-180', name: 'Carved TV Unit 180', category: 'TV Units', material: 'Sheesham wood', finish: 'Provincial teak', length_cm: 180, width_cm: 45, height_cm: 55,
+  P.tv = await pIns({ sku: 'AH-TVU-180', name: 'Carved TV Unit 180', category: 'TV Units', material: 'Sheesham wood', finish: 'Provincial teak', length_cm: 180, width_cm: 45, height_cm: 55,
     description: 'Low TV unit with two cabinets and an open shelf.', care, selling_price: 38500, cost_price: 22000, vendor: 'Jodhpur Woodcraft Works', shape: 'tv' });
-  P.shelf = pIns({ sku: 'AH-BKS-5T', name: 'Five Tier Book Shelf', category: 'Book Shelves', material: 'Sheesham wood', finish: 'Natural', length_cm: 90, width_cm: 35, height_cm: 180,
+  P.shelf = await pIns({ sku: 'AH-BKS-5T', name: 'Five Tier Book Shelf', category: 'Book Shelves', material: 'Sheesham wood', finish: 'Natural', length_cm: 90, width_cm: 35, height_cm: 180,
     description: 'Tall open bookshelf with five tiers.', care, selling_price: 21000, cost_price: 12500, vendor: 'Jodhpur Woodcraft Works', shape: 'shelf' });
-  P.desk = pIns({ sku: 'AH-STD-120', name: 'Study Table with Drawers', category: 'Office & Study', material: 'Sheesham wood', finish: 'Walnut', length_cm: 120, width_cm: 60, height_cm: 76,
+  P.desk = await pIns({ sku: 'AH-STD-120', name: 'Study Table with Drawers', category: 'Office & Study', material: 'Sheesham wood', finish: 'Walnut', length_cm: 120, width_cm: 60, height_cm: 76,
     description: 'Study table with three drawers on one side.', care, selling_price: 26000, cost_price: 15500, vendor: 'Jodhpur Woodcraft Works', shape: 'desk' });
 
   const u = users.store;
   // Hutch cabinet: five physical cabinets, same SKU, each its own piece.
-  const hutch = inv.receive(db, { productId: P.hutch, locationId: L.wh, userId: u, reference: 'GRN-1001', pieces: [
+  const hutch = (await inv.receive(db, { productId: P.hutch, locationId: L.wh, userId: u, reference: 'GRN-1001', pieces: [
     { condition: 'New', finish_note: 'Honey, even grain', cost_price: 41000, selling_price: 68000, rack: 'WH-A3' },
     { condition: 'New', finish_note: 'Honey, darker grain', cost_price: 41000, selling_price: 68000, rack: 'WH-A3' },
     { condition: 'Minor scratch on left side', finish_note: 'Honey', cost_price: 41000, selling_price: 61000, rack: 'WH-A4' },
     { condition: 'Glass panel cracked', finish_note: 'Honey', cost_price: 41000, selling_price: 68000, rack: 'WH-QC', status: 'damaged' },
-  ] }).created;
-  const showHutch = inv.receive(db, { productId: P.hutch, locationId: L.show, userId: u, reference: 'GRN-1001', pieces: [
+  ] })).created;
+  const showHutch = (await inv.receive(db, { productId: P.hutch, locationId: L.show, userId: u, reference: 'GRN-1001', pieces: [
     { condition: 'Display — light wear', finish_note: 'Honey', cost_price: 41000, selling_price: 64000, rack: 'Zone B · Wall 2', status: 'display' },
-  ] }).created;
-  db.prepare("INSERT INTO photos (product_id, piece_id, url, caption, is_public) VALUES (?, ?, ?, 'Scratch detail', 0)").run(P.hutch, hutch[2].id, `/seed-img/ah-cab-hutch.svg`);
-  inv.reserve(db, { pieceId: hutch[1].id, customerName: 'Mehta family', userId: users.sales });
+  ] })).created;
+  await db.query("INSERT INTO photos (product_id, piece_id, url, caption, is_public) VALUES ($1, $2, '/seed-img/ah-cab-hutch.svg', 'Scratch detail', 0)", [P.hutch, hutch[2].id]);
+  await inv.reserve(db, { pieceId: hutch[1].id, customerName: 'Mehta family', userId: users.sales });
 
-  inv.receive(db, { productId: P.jhula, locationId: L.show, userId: u, reference: 'ACQ-77', pieces: [
+  await inv.receive(db, { productId: P.jhula, locationId: L.show, userId: u, reference: 'ACQ-77', pieces: [
     { condition: 'Restored antique', finish_note: 'Aged natural teak', cost_price: 120000, selling_price: 210000, rack: 'Entrance atrium', status: 'display' },
   ] });
 
-  const rcv = (productId, loc, qty, rack, condition = 'sellable') => inv.receive(db, { productId, locationId: loc, qty, rack, condition, userId: u, reference: 'OPENING' });
-  rcv(P.diningHoney, L.show, 1, 'Zone A · Dining 1', 'display');
-  rcv(P.diningHoney, L.wh, 2, 'WH-C1');
-  rcv(P.diningWalnut, L.br, 1, 'Floor 1');
-  rcv(P.ganesha, L.show, 12, 'Zone D · Shelf 3');
-  rcv(P.ganesha, L.wh, 20, 'WH-S2');
-  rcv(P.ganesha, L.show, 1, 'Zone D · Shelf 3', 'damaged');
-  rcv(P.chest2, L.wh, 3, 'WH-B2');
-  rcv(P.sofa, L.wh, 1, 'WH-QC', 'damaged');
-  rcv(P.tv, L.show, 1, 'Zone C · Living 2', 'display_sale');
-  rcv(P.tv, L.wh, 2, 'WH-B5');
-  rcv(P.shelf, L.show, 2, 'Zone E');
-  rcv(P.desk, L.br, 3, 'Floor 2');
-  db.prepare("INSERT INTO incoming (product_id, kind, qty, expected_date, status, note, created_by) VALUES (?, 'purchase', 6, date('now', '+21 day'), 'ordered', 'PO-2231', ?)").run(P.chest, users.manager);
-  db.prepare("INSERT INTO incoming (product_id, kind, qty, expected_date, status, note, created_by) VALUES (?, 'production', 2, date('now', '+30 day'), 'ordered', 'Workshop batch', ?)").run(P.sofa, users.manager);
+  const rcv = (productId, l, qty, rack, condition = 'sellable') => inv.receive(db, { productId, locationId: l, qty, rack, condition, userId: u, reference: 'OPENING' });
+  await rcv(P.diningHoney, L.show, 1, 'Zone A · Dining 1', 'display');
+  await rcv(P.diningHoney, L.wh, 2, 'WH-C1');
+  await rcv(P.diningWalnut, L.br, 1, 'Floor 1');
+  await rcv(P.ganesha, L.show, 12, 'Zone D · Shelf 3');
+  await rcv(P.ganesha, L.wh, 20, 'WH-S2');
+  await rcv(P.ganesha, L.show, 1, 'Zone D · Shelf 3', 'damaged');
+  await rcv(P.chest2, L.wh, 3, 'WH-B2');
+  await rcv(P.sofa, L.wh, 1, 'WH-QC', 'damaged');
+  await rcv(P.tv, L.show, 1, 'Zone C · Living 2', 'display_sale');
+  await rcv(P.tv, L.wh, 2, 'WH-B5');
+  await rcv(P.shelf, L.show, 2, 'Zone E');
+  await rcv(P.desk, L.br, 3, 'Floor 2');
+  await db.query("INSERT INTO incoming (product_id, kind, qty, expected_date, status, note, created_by) VALUES ($1, 'purchase', 6, current_date + 21, 'ordered', 'PO-2231', $2)", [P.chest, users.manager]);
+  await db.query("INSERT INTO incoming (product_id, kind, qty, expected_date, status, note, created_by) VALUES ($1, 'production', 2, current_date + 30, 'ordered', 'Workshop batch', $2)", [P.sofa, users.manager]);
 
-  const vIns = db.prepare(`INSERT INTO videos (product_id, piece_id, title, url, youtube_id, video_type, is_primary, visibility, overrides_parent)
-    VALUES (?, ?, ?, ?, 'jNQXAC9IVRw', ?, ?, ?, ?)`);
-  vIns.run(P.hutch, null, 'Sample: Hutch cabinet overview (replace)', SAMPLE_VIDEO, 'overview', 1, 'customer', 0);
-  vIns.run(P.hutch, null, 'Sample: Assembly notes for delivery team (internal)', SAMPLE_VIDEO, 'installation', 0, 'internal', 0);
-  vIns.run(P.hutch, showHutch[0].id, 'Sample: Walkaround of this display cabinet', SAMPLE_VIDEO, 'demonstration', 0, 'customer', 0);
-  vIns.run(P.dining, null, 'Sample: Dining set overview (replace)', SAMPLE_VIDEO, 'overview', 1, 'customer', 0);
-  vIns.run(P.dining, null, 'Sample: Finish options explained', SAMPLE_VIDEO, 'finish', 0, 'customer', 0);
-  vIns.run(P.diningWalnut, null, 'Sample: Walnut finish close-up', SAMPLE_VIDEO, 'finish', 0, 'customer', 1);
-  vIns.run(P.ganesha, null, 'Sample: Brass care guide', SAMPLE_VIDEO, 'care', 1, 'customer', 0);
+  const vIns = (productId, pieceId, title, type, primary, visibility, overrides) => db.query(`INSERT INTO videos (product_id, piece_id, title, url, youtube_id, video_type, is_primary, visibility, overrides_parent)
+    VALUES ($1, $2, $3, $4, 'jNQXAC9IVRw', $5, $6, $7, $8)`, [productId, pieceId, title, SAMPLE_VIDEO, type, primary, visibility, overrides]);
+  await vIns(P.hutch, null, 'Sample: Hutch cabinet overview (replace)', 'overview', 1, 'customer', 0);
+  await vIns(P.hutch, null, 'Sample: Assembly notes for delivery team (internal)', 'installation', 0, 'internal', 0);
+  await vIns(P.hutch, showHutch[0].id, 'Sample: Walkaround of this display cabinet', 'demonstration', 0, 'customer', 0);
+  await vIns(P.dining, null, 'Sample: Dining set overview (replace)', 'overview', 1, 'customer', 0);
+  await vIns(P.dining, null, 'Sample: Finish options explained', 'finish', 0, 'customer', 0);
+  await vIns(P.diningWalnut, null, 'Sample: Walnut finish close-up', 'finish', 0, 'customer', 1);
+  await vIns(P.ganesha, null, 'Sample: Brass care guide', 'care', 1, 'customer', 0);
 
   return { users, locations: L, products: P, hutchPieces: [...hutch, ...showHutch] };
 }
 
-if (require.main === module) {
-  const file = process.env.DB_FILE || path.join(__dirname, '..', 'data', 'airawat.db');
-  for (const f of [file, `${file}-wal`, `${file}-shm`]) if (fs.existsSync(f)) fs.unlinkSync(f);
-  const db = open(file);
-  seed(db, { photoDir: path.join(__dirname, '..', 'public', 'seed-img') });
-  console.log(`Seeded ${file}`);
+/**
+ * Database setup: create tables (idempotent), lock them down, create the photo bucket,
+ * and load demo data only into an empty database (or with --reset, which wipes everything).
+ */
+async function setup({ reset = false, demo = true } = {}) {
+  const db = open();
+  try {
+    await migrate(db);
+    console.log('Tables ready (row level security on)');
+    if (await require('./storage').ensureBucket()) console.log('Photo storage bucket ready');
+    const { n } = await db.one('SELECT COUNT(*)::int n FROM users');
+    if (reset || (n === 0 && demo)) {
+      await seed(db, { photoDir: path.join(__dirname, '..', 'public', 'seed-img') });
+      console.log('Demo data loaded — demo logins are listed at the top of src/seed.js');
+    } else if (n > 0) {
+      console.log('Existing data kept (use --reset to wipe and reload demo data)');
+    }
+  } finally {
+    await db.close();
+  }
 }
 
-module.exports = { seed, USERS };
+if (require.main === module) {
+  require('./env');
+  const args = process.argv.slice(2);
+  setup({ reset: args.includes('--reset'), demo: !args.includes('--no-demo') }).catch((e) => { console.error(e.message); process.exit(1); });
+}
+
+module.exports = { seed, setup, USERS, photoSvg };

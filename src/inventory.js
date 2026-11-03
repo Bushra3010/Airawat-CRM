@@ -1,7 +1,8 @@
 'use strict';
 /**
  * Stock availability and movements. Every function that changes stock or
- * availability writes to stock_ledger inside the same transaction.
+ * availability writes to stock_ledger inside the same transaction, after locking
+ * the product (or piece) row so concurrent requests are serialised by Postgres.
  * Nothing here is called by the scan/lookup path — scanning is read-only.
  */
 const { nextCode, newToken } = require('./codes');
@@ -10,22 +11,41 @@ class StockError extends Error {
   constructor(message, status = 409) { super(message); this.status = status; }
 }
 
-const SALEABLE_PIECE = "(p.status = 'available' OR (p.status = 'display' AND p.display_for_sale = 1))";
+const SALEABLE_PIECE = "(status = 'available' OR (status = 'display' AND display_for_sale = 1))";
+let spSeq = 0;
 
-function ledger(db, e) {
-  db.prepare(`INSERT INTO stock_ledger (user_id, movement, product_id, piece_id, from_location_id, to_location_id, condition, qty, reference, note)
-    VALUES (@user_id, @movement, @product_id, @piece_id, @from_location_id, @to_location_id, @condition, @qty, @reference, @note)`).run({
-    user_id: null, piece_id: null, from_location_id: null, to_location_id: null, condition: null, reference: null, note: null, ...e,
-  });
+/**
+ * Run fn in a transaction. If db is already a transaction, use a savepoint so a
+ * failure can be rolled back on its own (used when confirming multi-line orders).
+ */
+async function inTx(db, fn) {
+  if (!db.inTx) return db.tx((t) => { t.inTx = true; return fn(t); });
+  const sp = `sp_${++spSeq}`;
+  await db.query(`SAVEPOINT ${sp}`);
+  try {
+    const out = await fn(db);
+    await db.query(`RELEASE SAVEPOINT ${sp}`);
+    return out;
+  } catch (e) {
+    await db.query(`ROLLBACK TO SAVEPOINT ${sp}`);
+    throw e;
+  }
 }
 
-function getProduct(db, id) {
-  const p = db.prepare('SELECT * FROM products WHERE id = ?').get(id);
+async function ledger(db, e) {
+  const r = { user_id: null, piece_id: null, from_location_id: null, to_location_id: null, condition: null, reference: null, note: null, ...e };
+  await db.query(`INSERT INTO stock_ledger (user_id, movement, product_id, piece_id, from_location_id, to_location_id, condition, qty, reference, note)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+  [r.user_id, r.movement, r.product_id, r.piece_id, r.from_location_id, r.to_location_id, r.condition, r.qty, r.reference, r.note]);
+}
+
+async function getProduct(db, id, lock = false) {
+  const p = await db.one(`SELECT * FROM products WHERE id = $1${lock ? ' FOR UPDATE' : ''}`, [Number(id)]);
   if (!p) throw new StockError('Product not found', 404);
   return p;
 }
-function getPiece(db, id) {
-  const p = db.prepare('SELECT * FROM pieces WHERE id = ?').get(id);
+async function getPiece(db, id, lock = false) {
+  const p = await db.one(`SELECT * FROM pieces WHERE id = $1${lock ? ' FOR UPDATE' : ''}`, [Number(id)]);
   if (!p) throw new StockError('Piece not found', 404);
   return p;
 }
@@ -37,36 +57,36 @@ function posInt(n, what = 'Quantity') {
 
 // ---------------- Availability ----------------
 
-function skuReservedAt(db, productId, locationId) {
-  return db.prepare(`SELECT COALESCE(SUM(qty),0) n FROM reservations
-    WHERE product_id = ? AND piece_id IS NULL AND location_id = ? AND status = 'active'`).get(productId, locationId).n;
+async function skuReservedAt(db, productId, locationId) {
+  return (await db.one(`SELECT COALESCE(SUM(qty),0)::int n FROM reservations
+    WHERE product_id = $1 AND piece_id IS NULL AND location_id = $2 AND status = 'active'`, [productId, locationId])).n;
 }
 
-function balance(db, productId, locationId, condition) {
-  const r = db.prepare('SELECT qty FROM stock_balances WHERE product_id = ? AND location_id = ? AND condition = ?').get(productId, locationId, condition);
+async function balance(db, productId, locationId, condition) {
+  const r = await db.one('SELECT qty FROM stock_balances WHERE product_id = $1 AND location_id = $2 AND condition = $3', [productId, locationId, condition]);
   return r ? r.qty : 0;
 }
 
-function adjustBalance(db, productId, locationId, condition, delta, rack) {
-  const cur = balance(db, productId, locationId, condition);
+async function adjustBalance(db, productId, locationId, condition, delta, rack) {
+  const cur = await balance(db, productId, locationId, condition);
   if (cur + delta < 0) throw new StockError(`Not enough ${condition.replace('_', ' ')} stock at this location (have ${cur})`);
   // (an UPSERT would trip the qty >= 0 CHECK on the candidate row for negative deltas)
-  const upd = db.prepare('UPDATE stock_balances SET qty = qty + ?, rack = COALESCE(?, rack) WHERE product_id = ? AND location_id = ? AND condition = ?')
-    .run(delta, rack || null, productId, locationId, condition);
-  if (!upd.changes) {
-    db.prepare('INSERT INTO stock_balances (product_id, location_id, condition, qty, rack) VALUES (?, ?, ?, ?, ?)').run(productId, locationId, condition, delta, rack || null);
+  const upd = await db.query('UPDATE stock_balances SET qty = qty + $1, rack = COALESCE($2, rack) WHERE product_id = $3 AND location_id = $4 AND condition = $5 RETURNING qty',
+    [delta, rack || null, productId, locationId, condition]);
+  if (!upd.length) {
+    await db.query('INSERT INTO stock_balances (product_id, location_id, condition, qty, rack) VALUES ($1, $2, $3, $4, $5)', [productId, locationId, condition, delta, rack || null]);
   }
 }
 
 /** Saleable, unreserved quantity of a SKU-tracked product at a location. */
-function skuAvailableAt(db, productId, locationId) {
-  const saleable = balance(db, productId, locationId, 'sellable') + balance(db, productId, locationId, 'display_sale');
-  return Math.max(0, saleable - skuReservedAt(db, productId, locationId));
+async function skuAvailableAt(db, productId, locationId) {
+  const saleable = await balance(db, productId, locationId, 'sellable') + await balance(db, productId, locationId, 'display_sale');
+  return Math.max(0, saleable - await skuReservedAt(db, productId, locationId));
 }
 
-function expectedAvailability(db, product) {
-  const inc = db.prepare(`SELECT kind, qty, expected_date FROM incoming WHERE product_id = ? AND status IN ('requested','ordered')
-    AND expected_date IS NOT NULL ORDER BY expected_date LIMIT 1`).get(product.id);
+async function expectedAvailability(db, product) {
+  const inc = await db.one(`SELECT kind, qty, expected_date FROM incoming WHERE product_id = $1 AND status IN ('requested','ordered')
+    AND expected_date IS NOT NULL ORDER BY expected_date LIMIT 1`, [product.id]);
   if (inc) return { date: inc.expected_date, source: inc.kind, qty: inc.qty };
   if (product.made_to_order && product.lead_time_days) {
     const d = new Date(Date.now() + product.lead_time_days * 864e5);
@@ -89,27 +109,29 @@ function classify({ available, reserved, display, damaged }, madeToOrder) {
  * physical = everything on hand; available = saleable and unreserved only
  * (display pieces count only when explicitly released for sale; damaged never).
  */
-function productAvailability(db, productId) {
-  const product = getProduct(db, productId);
-  const locs = db.prepare('SELECT * FROM locations ORDER BY CASE type WHEN \'showroom\' THEN 0 WHEN \'warehouse\' THEN 1 ELSE 2 END, name').all();
+async function productAvailability(db, productId) {
+  const product = await getProduct(db, productId);
+  const locs = await db.query("SELECT * FROM locations ORDER BY CASE type WHEN 'showroom' THEN 0 WHEN 'warehouse' THEN 1 ELSE 2 END, name");
   const byLocation = [];
   let inTransit = 0;
 
-  for (const loc of locs) {
-    let row;
-    if (product.tracking === 'sku') {
-      const b = (c) => balance(db, product.id, loc.id, c);
+  if (product.tracking === 'sku') {
+    const bal = await db.query('SELECT location_id, condition, qty, rack FROM stock_balances WHERE product_id = $1', [product.id]);
+    const res = await db.query(`SELECT location_id, SUM(qty)::int n FROM reservations WHERE product_id = $1 AND piece_id IS NULL AND status = 'active' GROUP BY location_id`, [product.id]);
+    for (const loc of locs) {
+      const b = (c) => (bal.find((x) => x.location_id === loc.id && x.condition === c) || { qty: 0 }).qty;
       const sellable = b('sellable'), displaySale = b('display_sale'), display = b('display'), damaged = b('damaged');
-      const reserved = skuReservedAt(db, product.id, loc.id);
-      const racks = db.prepare('SELECT DISTINCT rack FROM stock_balances WHERE product_id = ? AND location_id = ? AND qty > 0 AND rack IS NOT NULL').all(product.id, loc.id).map((r) => r.rack);
-      row = {
-        physical: sellable + displaySale + display + damaged,
-        reserved, available: Math.max(0, sellable + displaySale - reserved),
-        display, display_for_sale: displaySale, damaged, racks,
-      };
-    } else {
-      const ps = db.prepare('SELECT * FROM pieces WHERE product_id = ? AND location_id = ? AND status NOT IN (\'sold\',\'in_transit\')').all(product.id, loc.id);
-      row = {
+      const reserved = (res.find((r) => r.location_id === loc.id) || { n: 0 }).n;
+      const racks = [...new Set(bal.filter((x) => x.location_id === loc.id && x.qty > 0 && x.rack).map((x) => x.rack))];
+      const row = { physical: sellable + displaySale + display + damaged, reserved, available: Math.max(0, sellable + displaySale - reserved), display, display_for_sale: displaySale, damaged, racks };
+      if (row.physical > 0 || row.reserved > 0) byLocation.push({ location_id: loc.id, location: loc.name, location_code: loc.code, type: loc.type, ...row });
+    }
+  } else {
+    const all = await db.query("SELECT status, display_for_sale, location_id, rack FROM pieces WHERE product_id = $1 AND status != 'sold'", [product.id]);
+    inTransit = all.filter((p) => p.status === 'in_transit').length;
+    for (const loc of locs) {
+      const ps = all.filter((p) => p.location_id === loc.id && p.status !== 'in_transit');
+      const row = {
         physical: ps.length,
         reserved: ps.filter((p) => p.status === 'reserved').length,
         available: ps.filter((p) => p.status === 'available' || (p.status === 'display' && p.display_for_sale)).length,
@@ -118,11 +140,8 @@ function productAvailability(db, productId) {
         damaged: ps.filter((p) => p.status === 'damaged').length,
         racks: [...new Set(ps.map((p) => p.rack).filter(Boolean))],
       };
+      if (row.physical > 0 || row.reserved > 0) byLocation.push({ location_id: loc.id, location: loc.name, location_code: loc.code, type: loc.type, ...row });
     }
-    if (row.physical > 0 || row.reserved > 0) byLocation.push({ location_id: loc.id, location: loc.name, location_code: loc.code, type: loc.type, ...row });
-  }
-  if (product.tracking === 'piece') {
-    inTransit = db.prepare("SELECT COUNT(*) n FROM pieces WHERE product_id = ? AND status = 'in_transit'").get(product.id).n;
   }
   const sum = (k) => byLocation.reduce((s, r) => s + r[k], 0);
   const totals = {
@@ -132,7 +151,7 @@ function productAvailability(db, productId) {
   return {
     product_id: product.id, tracking: product.tracking, totals, byLocation,
     status: classify(totals, product.made_to_order),
-    expected: totals.available > 0 ? null : expectedAvailability(db, product),
+    expected: totals.available > 0 ? null : await expectedAvailability(db, product),
   };
 }
 
@@ -144,213 +163,215 @@ function pieceStatus(piece) {
 // ---------------- Reservations ----------------
 
 /**
- * Reserve a unique piece or SKU quantity. Runs as an IMMEDIATE transaction and the
- * piece update is conditional on the piece still being saleable, so two staff
- * reserving the same piece at the same time cannot both succeed.
+ * Reserve a unique piece or SKU quantity. The piece update is conditional on the
+ * piece still being saleable (Postgres re-checks the condition after any concurrent
+ * update commits) and a partial unique index allows one active reservation per piece,
+ * so two staff reserving the same piece at the same time cannot both succeed.
  */
 function reserve(db, { productId, pieceId, locationId, qty = 1, customerName, quotationId, userId }) {
-  return db.transaction(() => {
+  return inTx(db, async (t) => {
     if (pieceId) {
-      const piece = getPiece(db, pieceId);
-      const res = db.prepare(`UPDATE pieces AS p SET status = 'reserved' WHERE p.id = ? AND ${SALEABLE_PIECE}`).run(pieceId);
-      if (res.changes !== 1) {
-        throw new StockError(piece.status === 'reserved' ? 'This piece has just been reserved by someone else' : `This piece is not available to reserve (${pieceStatus(piece).replace('_', ' ')})`);
+      // Lock the piece row: a second concurrent request waits here, then sees it reserved.
+      const before = await getPiece(t, pieceId, true);
+      const upd = await t.one(`UPDATE pieces SET status = 'reserved' WHERE id = $1 AND ${SALEABLE_PIECE} RETURNING product_id, location_id`, [before.id]);
+      if (!upd) {
+        throw new StockError(before.status === 'reserved' ? 'This piece has just been reserved by someone else' : `This piece is not available to reserve (${pieceStatus(before).replace('_', ' ')})`);
       }
-      const r = db.prepare(`INSERT INTO reservations (product_id, piece_id, location_id, qty, piece_prev_status, customer_name, quotation_id, created_by)
-        VALUES (?, ?, ?, 1, ?, ?, ?, ?)`).run(piece.product_id, pieceId, piece.location_id, piece.status, customerName || null, quotationId || null, userId);
-      ledger(db, { user_id: userId, movement: 'reserve', product_id: piece.product_id, piece_id: pieceId, from_location_id: piece.location_id, qty: 1, reference: `RES-${r.lastInsertRowid}`, note: customerName });
-      return Number(r.lastInsertRowid);
+      const prev = before.status;
+      const r = await t.one(`INSERT INTO reservations (product_id, piece_id, location_id, qty, piece_prev_status, customer_name, quotation_id, created_by)
+        VALUES ($1, $2, $3, 1, $4, $5, $6, $7) RETURNING id`, [upd.product_id, pieceId, upd.location_id, prev, customerName || null, quotationId || null, userId]);
+      await ledger(t, { user_id: userId, movement: 'reserve', product_id: upd.product_id, piece_id: Number(pieceId), from_location_id: upd.location_id, qty: 1, reference: `RES-${r.id}`, note: customerName });
+      return r.id;
     }
-    const product = getProduct(db, productId);
+    const product = await getProduct(t, productId, true);
     if (product.tracking === 'piece') throw new StockError('This product is tracked by individual piece — choose the exact piece to reserve', 400);
     const n = posInt(qty);
-    let loc = locationId;
+    let loc = locationId ? Number(locationId) : null;
     if (!loc) {
-      const best = db.prepare('SELECT id FROM locations').all().map((l) => ({ id: l.id, a: skuAvailableAt(db, product.id, l.id) })).sort((a, b) => b.a - a.a)[0];
-      loc = best && best.id;
+      let best = { id: null, a: -1 };
+      for (const l of await t.query('SELECT id FROM locations')) { const a = await skuAvailableAt(t, product.id, l.id); if (a > best.a) best = { id: l.id, a }; }
+      loc = best.id;
     }
-    const avail = loc ? skuAvailableAt(db, product.id, loc) : 0;
+    const avail = loc ? await skuAvailableAt(t, product.id, loc) : 0;
     if (avail < n) throw new StockError(`Only ${avail} available to reserve at this location`);
-    const r = db.prepare(`INSERT INTO reservations (product_id, location_id, qty, customer_name, quotation_id, created_by) VALUES (?, ?, ?, ?, ?, ?)`)
-      .run(product.id, loc, n, customerName || null, quotationId || null, userId);
-    ledger(db, { user_id: userId, movement: 'reserve', product_id: product.id, from_location_id: loc, qty: n, reference: `RES-${r.lastInsertRowid}`, note: customerName });
-    return Number(r.lastInsertRowid);
-  }).immediate();
+    const r = await t.one('INSERT INTO reservations (product_id, location_id, qty, customer_name, quotation_id, created_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+      [product.id, loc, n, customerName || null, quotationId || null, userId]);
+    await ledger(t, { user_id: userId, movement: 'reserve', product_id: product.id, from_location_id: loc, qty: n, reference: `RES-${r.id}`, note: customerName });
+    return r.id;
+  });
 }
 
 function releaseReservation(db, reservationId, userId, reason = 'cancelled') {
-  return db.transaction(() => {
-    const r = db.prepare("SELECT * FROM reservations WHERE id = ?").get(reservationId);
+  return inTx(db, async (t) => {
+    const r = await t.one('SELECT * FROM reservations WHERE id = $1 FOR UPDATE', [Number(reservationId)]);
     if (!r) throw new StockError('Reservation not found', 404);
     if (r.status !== 'active') throw new StockError('Reservation is no longer active');
-    db.prepare("UPDATE reservations SET status = 'released', closed_at = datetime('now') WHERE id = ?").run(reservationId);
-    if (r.piece_id) {
-      db.prepare("UPDATE pieces SET status = ? WHERE id = ? AND status = 'reserved'").run(r.piece_prev_status || 'available', r.piece_id);
-    }
-    ledger(db, { user_id: userId, movement: 'release', product_id: r.product_id, piece_id: r.piece_id, from_location_id: r.location_id, qty: r.qty, reference: `RES-${r.id}`, note: reason });
-  }).immediate();
+    await t.query("UPDATE reservations SET status = 'released', closed_at = now() WHERE id = $1", [r.id]);
+    if (r.piece_id) await t.query("UPDATE pieces SET status = $1 WHERE id = $2 AND status = 'reserved'", [r.piece_prev_status || 'available', r.piece_id]);
+    await ledger(t, { user_id: userId, movement: 'release', product_id: r.product_id, piece_id: r.piece_id, from_location_id: r.location_id, qty: r.qty, reference: `RES-${r.id}`, note: reason });
+  });
 }
 
 // ---------------- Movements ----------------
 
 function receive(db, { productId, locationId, rack, qty, condition = 'sellable', pieces, incomingId, reference, userId }) {
-  return db.transaction(() => {
-    const product = getProduct(db, productId);
+  return inTx(db, async (t) => {
+    const product = await getProduct(t, productId, true);
     if (!locationId) throw new StockError('Choose a receiving location', 400);
     const created = [];
     if (product.tracking === 'piece') {
       const list = Array.isArray(pieces) && pieces.length ? pieces : Array.from({ length: posInt(qty) }, () => ({}));
       for (const spec of list) {
-        const cond = spec.status || (condition === 'damaged' ? 'damaged' : condition === 'display' ? 'display' : 'available');
-        const code = nextCode(db, 'AHU');
-        const r = db.prepare(`INSERT INTO pieces (piece_code, public_token, product_id, condition, finish_note, location_id, rack, status, cost_price, selling_price, notes)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(code, newToken(), product.id, spec.condition || 'New', spec.finish_note || null,
-          locationId, spec.rack || rack || null, cond, spec.cost_price ?? product.cost_price, spec.selling_price ?? product.selling_price, spec.notes || null);
-        ledger(db, { user_id: userId, movement: 'receive', product_id: product.id, piece_id: Number(r.lastInsertRowid), to_location_id: locationId, condition: cond, qty: 1, reference });
-        created.push({ id: Number(r.lastInsertRowid), piece_code: code });
+        const status = spec.status || (condition === 'damaged' ? 'damaged' : condition === 'display' ? 'display' : 'available');
+        const code = await nextCode(t, 'AHU');
+        const r = await t.one(`INSERT INTO pieces (piece_code, public_token, product_id, condition, finish_note, location_id, rack, status, cost_price, selling_price, notes)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`, [code, newToken(), product.id, spec.condition || 'New', spec.finish_note || null,
+          locationId, spec.rack || rack || null, status, spec.cost_price ?? product.cost_price, spec.selling_price ?? product.selling_price, spec.notes || null]);
+        await ledger(t, { user_id: userId, movement: 'receive', product_id: product.id, piece_id: r.id, to_location_id: locationId, condition: status, qty: 1, reference });
+        created.push({ id: r.id, piece_code: code });
       }
     } else {
       const n = posInt(qty);
-      adjustBalance(db, product.id, locationId, condition, n, rack);
-      ledger(db, { user_id: userId, movement: 'receive', product_id: product.id, to_location_id: locationId, condition, qty: n, reference });
+      await adjustBalance(t, product.id, locationId, condition, n, rack);
+      await ledger(t, { user_id: userId, movement: 'receive', product_id: product.id, to_location_id: locationId, condition, qty: n, reference });
     }
-    if (incomingId) db.prepare("UPDATE incoming SET status = 'received' WHERE id = ? AND product_id = ?").run(incomingId, product.id);
+    if (incomingId) await t.query("UPDATE incoming SET status = 'received' WHERE id = $1 AND product_id = $2", [incomingId, product.id]);
     return { created };
-  }).immediate();
+  });
 }
 
 function transfer(db, { productId, pieceId, fromLocationId, toLocationId, qty, condition = 'sellable', rack, reference, userId }) {
-  return db.transaction(() => {
+  return inTx(db, async (t) => {
     if (!toLocationId) throw new StockError('Choose a destination', 400);
     if (pieceId) {
-      const piece = getPiece(db, pieceId);
+      const piece = await getPiece(t, pieceId, true);
       if (piece.status === 'sold') throw new StockError('This piece has been sold');
       if (piece.location_id === Number(toLocationId) && (rack || null) === piece.rack) throw new StockError('Piece is already at this location', 400);
-      db.prepare('UPDATE pieces SET location_id = ?, rack = ? WHERE id = ?').run(toLocationId, rack || null, pieceId);
-      db.prepare("UPDATE reservations SET location_id = ? WHERE piece_id = ? AND status = 'active'").run(toLocationId, pieceId);
-      ledger(db, { user_id: userId, movement: 'transfer', product_id: piece.product_id, piece_id: pieceId, from_location_id: piece.location_id, to_location_id: toLocationId, qty: 1, reference, note: rack ? `rack ${rack}` : null });
+      await t.query('UPDATE pieces SET location_id = $1, rack = $2 WHERE id = $3', [toLocationId, rack || null, piece.id]);
+      await t.query("UPDATE reservations SET location_id = $1 WHERE piece_id = $2 AND status = 'active'", [toLocationId, piece.id]);
+      await ledger(t, { user_id: userId, movement: 'transfer', product_id: piece.product_id, piece_id: piece.id, from_location_id: piece.location_id, to_location_id: toLocationId, qty: 1, reference, note: rack ? `rack ${rack}` : null });
       return;
     }
-    const product = getProduct(db, productId);
+    const product = await getProduct(t, productId, true);
     if (product.tracking === 'piece') throw new StockError('Choose the exact piece to transfer', 400);
     if (!fromLocationId || Number(fromLocationId) === Number(toLocationId)) throw new StockError('Choose two different locations', 400);
     const n = posInt(qty);
     if (condition === 'sellable' || condition === 'display_sale') {
-      const free = skuAvailableAt(db, product.id, fromLocationId);
+      const free = await skuAvailableAt(t, product.id, fromLocationId);
       if (free < n) throw new StockError(`Only ${free} unreserved units can be moved from this location`);
     }
-    adjustBalance(db, product.id, fromLocationId, condition, -n);
-    adjustBalance(db, product.id, toLocationId, condition, n, rack);
-    ledger(db, { user_id: userId, movement: 'transfer', product_id: product.id, from_location_id: fromLocationId, to_location_id: toLocationId, condition, qty: n, reference });
-  }).immediate();
+    await adjustBalance(t, product.id, fromLocationId, condition, -n);
+    await adjustBalance(t, product.id, toLocationId, condition, n, rack);
+    await ledger(t, { user_id: userId, movement: 'transfer', product_id: product.id, from_location_id: fromLocationId, to_location_id: toLocationId, condition, qty: n, reference });
+  });
 }
 
 function dispatch(db, { productId, pieceId, locationId, qty, reservationId, reference, userId }) {
-  return db.transaction(() => {
+  return inTx(db, async (t) => {
     let res = null;
     if (reservationId) {
-      res = db.prepare("SELECT * FROM reservations WHERE id = ? AND status = 'active'").get(reservationId);
+      res = await t.one("SELECT * FROM reservations WHERE id = $1 AND status = 'active' FOR UPDATE", [Number(reservationId)]);
       if (!res) throw new StockError('Reservation is not active');
       pieceId = res.piece_id; productId = res.product_id; locationId = res.location_id; qty = res.qty;
     }
     if (pieceId) {
-      const piece = getPiece(db, pieceId);
+      const piece = await getPiece(t, pieceId, true);
       if (!res) {
-        res = db.prepare("SELECT * FROM reservations WHERE piece_id = ? AND status = 'active'").get(pieceId);
+        res = await t.one("SELECT * FROM reservations WHERE piece_id = $1 AND status = 'active' FOR UPDATE", [piece.id]);
         if (!res && !(piece.status === 'available' || (piece.status === 'display' && piece.display_for_sale))) {
           throw new StockError(`This piece cannot be dispatched (${pieceStatus(piece).replace('_', ' ')})`);
         }
       }
-      db.prepare("UPDATE pieces SET status = 'sold' WHERE id = ?").run(pieceId);
-      if (res) db.prepare("UPDATE reservations SET status = 'fulfilled', closed_at = datetime('now') WHERE id = ?").run(res.id);
-      ledger(db, { user_id: userId, movement: 'dispatch', product_id: piece.product_id, piece_id: pieceId, from_location_id: piece.location_id, qty: -1, reference });
+      await t.query("UPDATE pieces SET status = 'sold' WHERE id = $1", [piece.id]);
+      if (res) await t.query("UPDATE reservations SET status = 'fulfilled', closed_at = now() WHERE id = $1", [res.id]);
+      await ledger(t, { user_id: userId, movement: 'dispatch', product_id: piece.product_id, piece_id: piece.id, from_location_id: piece.location_id, qty: -1, reference });
       return;
     }
-    const product = getProduct(db, productId);
+    const product = await getProduct(t, productId, true);
     if (product.tracking === 'piece') throw new StockError('Choose the exact piece to dispatch', 400);
     if (!locationId) throw new StockError('Choose the dispatch location', 400);
     const n = posInt(qty);
-    if (!res && skuAvailableAt(db, product.id, locationId) < n) throw new StockError('Not enough unreserved stock to dispatch');
+    if (!res && await skuAvailableAt(t, product.id, locationId) < n) throw new StockError('Not enough unreserved stock to dispatch');
     // take sellable first, then display pieces released for sale
-    const fromSellable = Math.min(n, balance(db, product.id, locationId, 'sellable'));
-    if (fromSellable) adjustBalance(db, product.id, locationId, 'sellable', -fromSellable);
-    if (n - fromSellable) adjustBalance(db, product.id, locationId, 'display_sale', -(n - fromSellable));
-    if (res) db.prepare("UPDATE reservations SET status = 'fulfilled', closed_at = datetime('now') WHERE id = ?").run(res.id);
-    ledger(db, { user_id: userId, movement: 'dispatch', product_id: product.id, from_location_id: locationId, condition: 'sellable', qty: -n, reference: reference || (res ? `RES-${res.id}` : null) });
-  }).immediate();
+    const fromSellable = Math.min(n, await balance(t, product.id, locationId, 'sellable'));
+    if (fromSellable) await adjustBalance(t, product.id, locationId, 'sellable', -fromSellable);
+    if (n - fromSellable) await adjustBalance(t, product.id, locationId, 'display_sale', -(n - fromSellable));
+    if (res) await t.query("UPDATE reservations SET status = 'fulfilled', closed_at = now() WHERE id = $1", [res.id]);
+    await ledger(t, { user_id: userId, movement: 'dispatch', product_id: product.id, from_location_id: locationId, condition: 'sellable', qty: -n, reference: reference || (res ? `RES-${res.id}` : null) });
+  });
 }
 
 /** Stock count. SKU: set counted quantity (difference is posted). Piece: verify or relocate. */
 function count(db, { productId, pieceId, locationId, condition = 'sellable', countedQty, rack, userId, note }) {
-  return db.transaction(() => {
+  return inTx(db, async (t) => {
     if (pieceId) {
-      const piece = getPiece(db, pieceId);
+      const piece = await getPiece(t, pieceId, true);
       if (locationId && Number(locationId) !== piece.location_id) {
-        db.prepare('UPDATE pieces SET location_id = ?, rack = COALESCE(?, rack) WHERE id = ?').run(locationId, rack || null, pieceId);
-        ledger(db, { user_id: userId, movement: 'count_relocate', product_id: piece.product_id, piece_id: pieceId, from_location_id: piece.location_id, to_location_id: locationId, qty: 0, note: note || 'Found at a different location during count' });
+        await t.query('UPDATE pieces SET location_id = $1, rack = COALESCE($2, rack) WHERE id = $3', [locationId, rack || null, piece.id]);
+        await ledger(t, { user_id: userId, movement: 'count_relocate', product_id: piece.product_id, piece_id: piece.id, from_location_id: piece.location_id, to_location_id: locationId, qty: 0, note: note || 'Found at a different location during count' });
       } else {
-        ledger(db, { user_id: userId, movement: 'count_verify', product_id: piece.product_id, piece_id: pieceId, from_location_id: piece.location_id, qty: 0, note });
+        await ledger(t, { user_id: userId, movement: 'count_verify', product_id: piece.product_id, piece_id: piece.id, from_location_id: piece.location_id, qty: 0, note });
       }
       return { delta: 0 };
     }
-    const product = getProduct(db, productId);
+    const product = await getProduct(t, productId, true);
     if (!locationId) throw new StockError('Choose the count location', 400);
     const counted = Number(countedQty);
     if (!Number.isInteger(counted) || counted < 0) throw new StockError('Counted quantity must be zero or more', 400);
-    const delta = counted - balance(db, product.id, locationId, condition);
-    if (delta !== 0) adjustBalance(db, product.id, locationId, condition, delta, rack);
-    ledger(db, { user_id: userId, movement: 'count_adjust', product_id: product.id, to_location_id: locationId, condition, qty: delta, note: note || `Counted ${counted}` });
+    const delta = counted - await balance(t, product.id, locationId, condition);
+    if (delta !== 0) await adjustBalance(t, product.id, locationId, condition, delta, rack);
+    await ledger(t, { user_id: userId, movement: 'count_adjust', product_id: product.id, to_location_id: locationId, condition, qty: delta, note: note || `Counted ${counted}` });
     return { delta };
-  }).immediate();
+  });
 }
 
 /** Re-classify stock: sellable/display/display_sale/damaged (SKU) or piece status. */
 function changeCondition(db, { productId, pieceId, locationId, fromCondition, toCondition, qty, userId, note }) {
   const valid = ['sellable', 'display', 'display_sale', 'damaged'];
-  if (!valid.includes(toCondition)) throw new StockError('Unknown condition', 400);
-  return db.transaction(() => {
+  if (!valid.includes(toCondition)) return Promise.reject(new StockError('Unknown condition', 400));
+  return inTx(db, async (t) => {
     if (pieceId) {
-      const piece = getPiece(db, pieceId);
+      const piece = await getPiece(t, pieceId, true);
       if (['reserved', 'sold'].includes(piece.status)) throw new StockError(`A ${piece.status} piece cannot be re-classified`);
       const status = { sellable: 'available', display: 'display', display_sale: 'display', damaged: 'damaged' }[toCondition];
-      db.prepare('UPDATE pieces SET status = ?, display_for_sale = ? WHERE id = ?').run(status, toCondition === 'display_sale' ? 1 : 0, pieceId);
-      ledger(db, { user_id: userId, movement: 'reclassify', product_id: piece.product_id, piece_id: pieceId, from_location_id: piece.location_id, condition: toCondition, qty: 0, note: note || `${piece.status} → ${toCondition}` });
+      await t.query('UPDATE pieces SET status = $1, display_for_sale = $2 WHERE id = $3', [status, toCondition === 'display_sale' ? 1 : 0, piece.id]);
+      await ledger(t, { user_id: userId, movement: 'reclassify', product_id: piece.product_id, piece_id: piece.id, from_location_id: piece.location_id, condition: toCondition, qty: 0, note: note || `${piece.status} → ${toCondition}` });
       return;
     }
-    const product = getProduct(db, productId);
+    const product = await getProduct(t, productId, true);
     if (!valid.includes(fromCondition) || fromCondition === toCondition) throw new StockError('Choose two different conditions', 400);
     const n = posInt(qty);
     if (fromCondition === 'sellable' || fromCondition === 'display_sale') {
-      const free = skuAvailableAt(db, product.id, locationId);
+      const free = await skuAvailableAt(t, product.id, locationId);
       if (free < n) throw new StockError(`Only ${free} unreserved units can be re-classified`);
     }
-    adjustBalance(db, product.id, locationId, fromCondition, -n);
-    adjustBalance(db, product.id, locationId, toCondition, n);
-    ledger(db, { user_id: userId, movement: 'reclassify', product_id: product.id, from_location_id: locationId, to_location_id: locationId, condition: `${fromCondition}→${toCondition}`, qty: n, note });
-  }).immediate();
+    await adjustBalance(t, product.id, locationId, fromCondition, -n);
+    await adjustBalance(t, product.id, locationId, toCondition, n);
+    await ledger(t, { user_id: userId, movement: 'reclassify', product_id: product.id, from_location_id: locationId, to_location_id: locationId, condition: `${fromCondition}→${toCondition}`, qty: n, note });
+  });
 }
 
 /** Customer return after inspection: goes back as sellable or damaged. */
 function returnInspected(db, { productId, pieceId, locationId, qty = 1, result, rack, reference, userId, note }) {
-  if (!['sellable', 'damaged'].includes(result)) throw new StockError('Inspection result must be sellable or damaged', 400);
-  if (!locationId) throw new StockError('Choose where the return is stored', 400);
-  return db.transaction(() => {
+  if (!['sellable', 'damaged'].includes(result)) return Promise.reject(new StockError('Inspection result must be sellable or damaged', 400));
+  if (!locationId) return Promise.reject(new StockError('Choose where the return is stored', 400));
+  return inTx(db, async (t) => {
     if (pieceId) {
-      const piece = getPiece(db, pieceId);
+      const piece = await getPiece(t, pieceId, true);
       if (piece.status !== 'sold') throw new StockError('Only a sold piece can be returned');
-      db.prepare('UPDATE pieces SET status = ?, display_for_sale = 0, location_id = ?, rack = ? WHERE id = ?')
-        .run(result === 'sellable' ? 'available' : 'damaged', locationId, rack || null, pieceId);
-      ledger(db, { user_id: userId, movement: 'return', product_id: piece.product_id, piece_id: pieceId, to_location_id: locationId, condition: result, qty: 1, reference, note });
+      await t.query('UPDATE pieces SET status = $1, display_for_sale = 0, location_id = $2, rack = $3 WHERE id = $4',
+        [result === 'sellable' ? 'available' : 'damaged', locationId, rack || null, piece.id]);
+      await ledger(t, { user_id: userId, movement: 'return', product_id: piece.product_id, piece_id: piece.id, to_location_id: locationId, condition: result, qty: 1, reference, note });
       return;
     }
-    const product = getProduct(db, productId);
+    const product = await getProduct(t, productId, true);
     const n = posInt(qty);
-    adjustBalance(db, product.id, locationId, result, n, rack);
-    ledger(db, { user_id: userId, movement: 'return', product_id: product.id, to_location_id: locationId, condition: result, qty: n, reference, note });
-  }).immediate();
+    await adjustBalance(t, product.id, locationId, result, n, rack);
+    await ledger(t, { user_id: userId, movement: 'return', product_id: product.id, to_location_id: locationId, condition: result, qty: n, reference, note });
+  });
 }
 
 module.exports = {
-  StockError, productAvailability, pieceStatus, skuAvailableAt, reserve, releaseReservation,
+  StockError, inTx, productAvailability, pieceStatus, skuAvailableAt, reserve, releaseReservation,
   receive, transfer, dispatch, count, changeCondition, returnInspected, ledger,
 };

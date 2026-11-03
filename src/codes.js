@@ -87,12 +87,11 @@ function code128Bars(text) {
 const PRODUCT_PREFIX = 'AHP';
 const PIECE_PREFIX = 'AHU';
 
-function nextCode(db, prefix) {
-  const row = db.prepare('SELECT next_value FROM code_sequences WHERE prefix = ?').get(prefix);
-  const n = row ? row.next_value : 1;
-  if (row) db.prepare('UPDATE code_sequences SET next_value = ? WHERE prefix = ?').run(n + 1, prefix);
-  else db.prepare('INSERT INTO code_sequences(prefix, next_value) VALUES (?, ?)').run(prefix, n + 1);
-  return `${prefix}-${String(n).padStart(6, '0')}`;
+/** Next stable code for a prefix, e.g. AHP-000123. Atomic, so concurrent requests never share a code. */
+async function nextCode(db, prefix) {
+  const row = await db.one(`INSERT INTO code_sequences (prefix, next_value) VALUES ($1, 2)
+    ON CONFLICT (prefix) DO UPDATE SET next_value = code_sequences.next_value + 1 RETURNING next_value`, [prefix]);
+  return `${prefix}-${String(row.next_value - 1).padStart(6, '0')}`;
 }
 
 function newToken() {
@@ -126,11 +125,11 @@ function normaliseMfrBarcode(raw) {
 }
 
 /** Ensure a code is not already used by any product/piece (internal or manufacturer). */
-function assertCodeFree(db, code, except = {}) {
+async function assertCodeFree(db, code, except = {}) {
   if (!code) return;
-  const hits = db.prepare(`
-    SELECT 'product' AS type, id FROM products WHERE internal_code = @c OR mfr_barcode = @c OR sku = @c
-    UNION ALL SELECT 'piece', id FROM pieces WHERE piece_code = @c OR mfr_barcode = @c`).all({ c: code });
+  const hits = await db.query(`
+    SELECT 'product' AS type, id FROM products WHERE internal_code = $1 OR mfr_barcode = $1 OR sku = $1
+    UNION ALL SELECT 'piece', id FROM pieces WHERE piece_code = $1 OR mfr_barcode = $1`, [code]);
   const clash = hits.find((h) => !(h.type === except.type && h.id === except.id));
   if (clash) {
     const err = new Error(`Barcode "${code}" is already assigned to another ${clash.type}`);

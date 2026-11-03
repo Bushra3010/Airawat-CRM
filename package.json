@@ -4,20 +4,24 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "seed": "node src/seed.js",
     "test": "node --test test/",
-    "cert": "sh scripts/make-cert.sh"
+    "cert": "sh scripts/make-cert.sh",
+    "build": "node scripts/build.js",
+    "db:setup": "node src/seed.js",
+    "db:reset": "node src/seed.js --reset"
   },
   "description": "Airawat Handicraft showroom product finder, piece tracking, barcode/QR labels and product videos",
   "dependencies": {
     "@zxing/library": "^0.21.3",
-    "better-sqlite3": "^11.10.0",
     "express": "^4.22.3",
     "html5-qrcode": "^2.3.8",
     "pdfkit": "^0.15.2",
-    "qrcode": "1.5"
+    "pg": "^8.23.1",
+    "qrcode": "1.5",
+    "serverless-http": "^3.2.0"
   },
   "devDependencies": {
+    "embedded-postgres": "^17.5.0-beta.15",
     "jsqr": "^1.4.0"
   },
   "private": true,
