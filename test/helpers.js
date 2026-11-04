@@ -49,4 +49,4 @@ async function setup() {
   return { db, url: pg.url, ids, base, login, close };
 }
 
-module.exports = { setup };
+module.exports = { setup, startPostgres };

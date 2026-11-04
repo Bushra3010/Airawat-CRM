@@ -51,10 +51,10 @@ sheet.el.addEventListener('click', (e) => { if (e.target.matches('[data-close]')
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !sheet.el.hidden) sheet.close(); });
 
 /** Explicit confirmation step for anything that changes stock. */
-function confirmAction(title, lines, label = 'Confirm') {
+function confirmAction(title, lines, label = 'Confirm', note = 'This will update stock and be recorded in the stock ledger.') {
   return new Promise((resolve) => {
     const b = sheet.open(`<h2>${esc(title)}</h2><div class="card" style="box-shadow:none;border:1px solid var(--line)">${lines.map((l) => `<div>${l}</div>`).join('')}</div>
-      <p class="muted small">This will update stock and be recorded in the stock ledger.</p>
+      ${note ? `<p class="muted small">${esc(note)}</p>` : ''}
       <div class="row"><button class="btn" data-close>Cancel</button><span class="spacer"></span><button class="btn primary" id="cfm">${esc(label)}</button></div>`);
     let done = false;
     sheet.onclose = () => { if (!done) resolve(false); };
@@ -87,14 +87,18 @@ async function router() {
   const [name, arg] = pathPart.split('/');
   const params = new URLSearchParams(qs || '');
   if (!ME && name !== 'login') {
-    try { ME = await api('/me'); LOCS = await api('/locations'); } catch { return; }
+    try { ME = await api('/me'); LOCS = await api('/locations'); } catch (e) {
+      // 401 already sent us to sign-in; anything else (e.g. first-run setup not done) is shown here
+      if (!/sign in/i.test(e.message)) view.innerHTML = `<div class="notice bad" style="margin-top:20px">${esc(e.message)}</div>`;
+      return;
+    }
   }
   stopScanner();
   $('#tabs').hidden = !ME;
   $('#who').innerHTML = ME ? `${esc(ME.name)}` : '';
   renderCustbar();
   const tab = { product: 'find', piece: 'find', shortlist: 'shortlists', ledger: 'stock' }[name] || name;
-  $$('#tabs a').forEach((a) => a.classList.toggle('on', a.dataset.tab === tab || (a.dataset.tab === 'more' && ['quotations', 'quotation', 'labels', 'enquiries', 'edit', 'settings'].includes(name))));
+  $$('#tabs a').forEach((a) => a.classList.toggle('on', a.dataset.tab === tab || (a.dataset.tab === 'more' && ['quotations', 'quotation', 'labels', 'enquiries', 'edit', 'settings', 'users', 'locations', 'password'].includes(name))));
   const fn = routes[name] || routes.find;
   view.innerHTML = '<p class="muted">Loading…</p>';
   try { await fn(arg, params); } catch (e) { if (ME) view.innerHTML = `<div class="notice bad">${esc(e.message)}</div>`; }
@@ -817,7 +821,9 @@ route('more', async () => {
     ${can('labels') ? '<a href="#/labels">Barcode &amp; QR labels <span>›</span></a>' : ''}
     <a href="#/ledger">Stock ledger <span>›</span></a>
     ${can('manage_products') ? '<a href="#/edit/new">Add a product <span>›</span></a>' : ''}
-    ${can('manage_settings') ? '<a href="#/settings">Settings &amp; customer pages <span>›</span></a>' : ''}
+    ${can('manage_settings') ? '<a href="#/settings">Settings &amp; customer pages <span>›</span></a><a href="#/locations">Locations <span>›</span></a>' : ''}
+    ${can('manage_users') ? '<a href="#/users">Staff &amp; passwords <span>›</span></a>' : ''}
+    <a href="#/password">Change my password <span>›</span></a>
     <a href="#" id="logout">Sign out <span>›</span></a></div><p class="small muted">Signed in as ${esc(ME.name)} (${esc(ME.role)})</p>`;
   $('#logout').onclick = async (e) => { e.preventDefault(); await api('/logout', { method: 'POST', body: {} }); ME = null; current.set(null); location.hash = '#/login'; };
 });
@@ -962,6 +968,116 @@ route('settings', async () => {
       public_pages_enabled: fm.public_pages_enabled.checked, public_show_prices: fm.public_show_prices.checked, public_show_expected_date: fm.public_show_expected_date.checked,
       availability_wording: Object.fromEntries($$('[data-w]').map((i) => [i.dataset.w, i.value])) };
     try { await api('/settings', { method: 'PUT', body }); toast('Settings saved'); } catch (err) { fail(err); }
+  };
+});
+
+// ---------------- staff users & passwords ----------------
+const ROLE_INFO = {
+  sales: 'Sales — find, shortlist, quote, reserve',
+  storekeeper: 'Storekeeper — receive, transfer, dispatch, count',
+  manager: 'Manager — everything, sees costs, edits products & settings',
+  admin: 'Admin — everything, plus staff logins',
+};
+/** Readable random password (no look-alike characters), made in the browser. */
+function makePassword() {
+  const chars = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const v = crypto.getRandomValues(new Uint32Array(12));
+  const s = [...v].map((n) => chars[n % chars.length]).join('');
+  return `${s.slice(0, 4)}-${s.slice(4, 8)}-${s.slice(8)}`;
+}
+function showPassword(name, pw) {
+  const b = sheet.open(`<h2>Password for ${esc(name)}</h2>
+    <p>Give this to them in person. It is not shown again.</p>
+    <div class="card mono" style="font-size:1.3rem;text-align:center;user-select:all">${esc(pw)}</div>
+    <div class="row"><button class="btn" id="cp">Copy</button><span class="spacer"></span><button class="btn primary" data-close>Done</button></div>`);
+  $('#cp', b).onclick = () => navigator.clipboard.writeText(pw).then(() => toast('Copied'), () => toast('Copy failed', true));
+}
+const roleOptions = (sel) => Object.entries(ROLE_INFO).map(([k, v]) => `<option value="${k}" ${k === sel ? 'selected' : ''}>${esc(v)}</option>`).join('');
+
+route('users', async () => {
+  if (!can('manage_users')) throw new Error('Only admins can manage staff logins');
+  const users = await api('/users');
+  view.innerHTML = `<div class="row"><h1>Staff &amp; passwords</h1><span class="spacer"></span><button class="btn primary" id="adduser">Add staff member</button></div>
+    <p class="small muted">Each person gets their own login, so the stock ledger shows who did what. Changing someone's role or password signs them out on their other devices.</p>
+    <div class="list">${users.map((u) => `<div class="item"><div class="grow"><div class="t">${esc(u.name)}${u.id === ME.id ? ' <span class="small muted">(you)</span>' : ''}</div>
+      <div class="small muted"><span class="mono">${esc(u.username)}</span> · ${esc(u.role)}</div></div>
+      ${u.active ? '' : '<span class="badge b-out_of_stock">Disabled</span>'}<button class="btn sm" data-edit="${u.id}">Edit</button></div>`).join('')}</div>`;
+  $('#adduser').onclick = () => {
+    const b = sheet.open(`<h2>Add staff member</h2><form id="uf">
+      <label>Name<input name="name" required maxlength="80"></label>
+      <label>Username (for signing in)<input name="username" required autocapitalize="none" pattern="[a-zA-Z0-9._\\-]{3,40}" placeholder="e.g. priya"></label>
+      <label>Role<select name="role">${roleOptions('sales')}</select></label>
+      <label>Password</label><div class="row"><input name="password" required minlength="10" style="flex:1" autocomplete="new-password" aria-label="Password"><button type="button" class="btn" id="gen">Generate</button></div>
+      <p class="small muted">At least 10 characters.</p>
+      <button class="btn primary block">Create login</button></form>`);
+    $('#gen', b).onclick = () => { $('[name=password]', b).value = makePassword(); };
+    $('[name=password]', b).value = makePassword();
+    $('#uf', b).onsubmit = async (e) => {
+      e.preventDefault();
+      const f = formData(e.target);
+      try { await api('/users', { method: 'POST', body: f }); sheet.close(); await router(); showPassword(f.name, f.password); } catch (err) { fail(err); }
+    };
+  };
+  $$('[data-edit]').forEach((btn) => { btn.onclick = () => {
+    const u = users.find((x) => x.id === Number(btn.dataset.edit));
+    const self = u.id === ME.id;
+    const b = sheet.open(`<h2>${esc(u.name)}</h2><p class="small muted mono">${esc(u.username)}</p><form id="ef">
+      <label>Name<input name="name" value="${esc(u.name)}" maxlength="80"></label>
+      <label>Role<select name="role" ${self ? 'disabled' : ''}>${roleOptions(u.role)}</select></label>
+      ${self ? '<p class="small muted">You can\'t change your own role or disable yourself.</p>' : `<label class="check"><input type="checkbox" name="active" ${u.active ? 'checked' : ''}> Can sign in</label>`}
+      <button class="btn primary block">Save</button></form>
+      <h3>Reset password</h3><p class="small muted">Use this when someone forgets their password. They are signed out everywhere.</p>
+      <button class="btn block" id="reset">Set a new password…</button>`);
+    $('#ef', b).onsubmit = async (e) => {
+      e.preventDefault();
+      const f = formData(e.target);
+      const body = { name: f.name };
+      if (!self) { body.role = f.role; body.active = f.active; }
+      try { await api('/users/' + u.id, { method: 'PATCH', body }); sheet.close(); toast('Saved'); router(); } catch (err) { fail(err); }
+    };
+    $('#reset', b).onclick = async () => {
+      const pw = makePassword();
+      sheet.close();
+      if (!(await confirmAction(`Reset ${u.name}'s password`, [esc(`A new password is generated and shown once.`), 'They are signed out on all devices.'], 'Reset password', ''))) return;
+      try { await api('/users/' + u.id, { method: 'PATCH', body: { password: pw } }); showPassword(u.name, pw); } catch (err) { fail(err); }
+    };
+  }; });
+});
+
+route('password', async () => {
+  view.innerHTML = `<h1>Change my password</h1><form id="pf" class="card" style="max-width:420px">
+    <label>Current password<input name="current_password" type="password" required autocomplete="current-password"></label>
+    <label>New password<input name="new_password" type="password" required minlength="10" autocomplete="new-password"></label>
+    <label>New password again<input name="again" type="password" required minlength="10" autocomplete="new-password"></label>
+    <p class="small muted">At least 10 characters. You stay signed in here; other devices are signed out.</p>
+    <button class="btn primary block">Change password</button></form>`;
+  $('#pf').onsubmit = async (e) => {
+    e.preventDefault();
+    const f = formData(e.target);
+    if (f.new_password !== f.again) return toast('The new passwords do not match', true);
+    try { await api('/me/password', { method: 'POST', body: { current_password: f.current_password, new_password: f.new_password } }); e.target.reset(); toast('Password changed'); } catch (err) { fail(err); }
+  };
+});
+
+// ---------------- locations ----------------
+route('locations', async () => {
+  if (!can('manage_settings')) throw new Error('You do not have permission to change locations');
+  LOCS = await api('/locations');
+  const typeOpts = (sel) => ['showroom', 'warehouse', 'branch'].map((t) => `<option ${t === sel ? 'selected' : ''}>${t}</option>`).join('');
+  view.innerHTML = `<h1>Locations</h1><p class="small muted">Showrooms, warehouses and branches that hold stock. The rack or zone is entered per item when stock is received or moved.</p>
+    <div class="list">${LOCS.map((l) => `<form class="item" data-loc="${l.id}" style="flex-wrap:wrap"><span class="mono small" style="width:46px">${esc(l.code)}</span>
+      <input name="name" value="${esc(l.name)}" aria-label="Name" style="flex:1 1 180px;min-width:0"><select name="type" aria-label="Type" style="width:auto;flex:1 0 auto">${typeOpts(l.type)}</select>
+      <button class="btn sm">Save</button></form>`).join('')}</div>
+    <h2>Add a location</h2><form id="lf" class="card"><div class="grid2"><label>Short code<input name="code" required maxlength="10" placeholder="BR3" autocapitalize="characters"></label>
+      <label>Type<select name="type">${typeOpts('branch')}</select></label></div><label>Name<input name="name" required maxlength="80" placeholder="Kothrud Branch"></label>
+      <button class="btn primary" style="margin-top:8px">Add location</button></form>`;
+  $$('[data-loc]').forEach((fm) => { fm.onsubmit = async (e) => {
+    e.preventDefault();
+    try { await api('/locations/' + fm.dataset.loc, { method: 'PATCH', body: formData(fm) }); toast('Saved'); LOCS = await api('/locations'); } catch (err) { fail(err); }
+  }; });
+  $('#lf').onsubmit = async (e) => {
+    e.preventDefault();
+    try { await api('/locations', { method: 'POST', body: formData(e.target) }); toast('Location added'); router(); } catch (err) { fail(err); }
   };
 });
 
