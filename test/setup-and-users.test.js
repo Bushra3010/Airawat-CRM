@@ -141,3 +141,10 @@ test('instances starting at the same time migrate without deadlocking', async ()
     await Promise.all(pools.map((p) => p.close()));
   }
 });
+
+test('malformed ids are rejected as bad requests, not server errors', async () => {
+  const admin = (await login('admin', ADMIN_PW)).cookie;
+  for (const p of ['/quotations/abc', '/products/abc', '/pieces/1.5x', '/shortlists/undefined']) {
+    assert.equal((await call('GET', p, null, admin)).status, 400, p);
+  }
+});

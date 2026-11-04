@@ -64,10 +64,12 @@ function createApp({ db, uploadDir = path.join(__dirname, '..', 'data', 'uploads
   };
   function sendErr(res, e) {
     const dupRes = e.code === '23505' && /ux_res_piece_active/.test(e.constraint || e.message);
-    const status = dupRes ? 409 : e.status || (e.code === '23505' ? 409 : /^23/.test(e.code || '') ? 400 : 500);
+    // 23xxx = constraint violations; 22xxx = bad input such as a non-numeric id
+    const badInput = /^22/.test(e.code || '');
+    const status = dupRes ? 409 : e.status || (e.code === '23505' ? 409 : /^23/.test(e.code || '') || badInput ? 400 : 500);
     if (status === 500) console.error(e);
     if (res.headersSent) return;
-    res.status(status).json({ error: status === 500 ? 'Something went wrong' : dupRes ? 'This piece has just been reserved by someone else' : e.message });
+    res.status(status).json({ error: status === 500 ? 'Something went wrong' : dupRes ? 'This piece has just been reserved by someone else' : badInput ? 'Invalid request' : e.message });
   }
 
   app.use((req, res, next) => {
