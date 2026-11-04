@@ -20,6 +20,7 @@ let spSeq = 0;
  */
 async function inTx(db, fn) {
   if (!db.inTx) return db.tx((t) => { t.inTx = true; return fn(t); });
+  if (db.noSavepoints) return fn(db);
   const sp = `sp_${++spSeq}`;
   await db.query(`SAVEPOINT ${sp}`);
   try {
@@ -57,36 +58,39 @@ function posInt(n, what = 'Quantity') {
 
 // ---------------- Availability ----------------
 
-async function skuReservedAt(db, productId, locationId) {
-  return (await db.one(`SELECT COALESCE(SUM(qty),0)::int n FROM reservations
-    WHERE product_id = $1 AND piece_id IS NULL AND location_id = $2 AND status = 'active'`, [productId, locationId])).n;
-}
-
 async function balance(db, productId, locationId, condition) {
   const r = await db.one('SELECT qty FROM stock_balances WHERE product_id = $1 AND location_id = $2 AND condition = $3', [productId, locationId, condition]);
   return r ? r.qty : 0;
 }
 
 async function adjustBalance(db, productId, locationId, condition, delta, rack) {
+  // One round trip in the usual case: the update only applies if stock stays >= 0.
+  // (an UPSERT would trip the qty >= 0 CHECK on the candidate row for negative deltas)
+  const upd = await db.query('UPDATE stock_balances SET qty = qty + $1, rack = COALESCE($2, rack) WHERE product_id = $3 AND location_id = $4 AND condition = $5 AND qty + $1 >= 0 RETURNING qty',
+    [delta, rack || null, productId, locationId, condition]);
+  if (upd.length) return;
   const cur = await balance(db, productId, locationId, condition);
   if (cur + delta < 0) throw new StockError(`Not enough ${condition.replace('_', ' ')} stock at this location (have ${cur})`);
-  // (an UPSERT would trip the qty >= 0 CHECK on the candidate row for negative deltas)
-  const upd = await db.query('UPDATE stock_balances SET qty = qty + $1, rack = COALESCE($2, rack) WHERE product_id = $3 AND location_id = $4 AND condition = $5 RETURNING qty',
-    [delta, rack || null, productId, locationId, condition]);
-  if (!upd.length) {
-    await db.query('INSERT INTO stock_balances (product_id, location_id, condition, qty, rack) VALUES ($1, $2, $3, $4, $5)', [productId, locationId, condition, delta, rack || null]);
-  }
+  await db.query('INSERT INTO stock_balances (product_id, location_id, condition, qty, rack) VALUES ($1, $2, $3, $4, $5)', [productId, locationId, condition, delta, rack || null]);
 }
 
 /** Saleable, unreserved quantity of a SKU-tracked product at a location. */
 async function skuAvailableAt(db, productId, locationId) {
-  const saleable = await balance(db, productId, locationId, 'sellable') + await balance(db, productId, locationId, 'display_sale');
-  return Math.max(0, saleable - await skuReservedAt(db, productId, locationId));
+  return (await db.one(`SELECT GREATEST(0,
+      COALESCE((SELECT SUM(qty) FROM stock_balances WHERE product_id = $1 AND location_id = $2 AND condition IN ('sellable','display_sale')), 0)
+    - COALESCE((SELECT SUM(qty) FROM reservations WHERE product_id = $1 AND location_id = $2 AND piece_id IS NULL AND status = 'active'), 0))::int AS n`,
+  [productId, locationId])).n;
 }
 
-async function expectedAvailability(db, product) {
-  const inc = await db.one(`SELECT kind, qty, expected_date FROM incoming WHERE product_id = $1 AND status IN ('requested','ordered')
-    AND expected_date IS NOT NULL ORDER BY expected_date LIMIT 1`, [product.id]);
+/** The location with the most saleable, unreserved stock of a SKU product. */
+async function bestSkuLocation(db, productId) {
+  return db.one(`SELECT l.id, GREATEST(0, COALESCE(b.q, 0) - COALESCE(r.q, 0))::int AS available FROM locations l
+    LEFT JOIN (SELECT location_id, SUM(qty) q FROM stock_balances WHERE product_id = $1 AND condition IN ('sellable','display_sale') GROUP BY 1) b ON b.location_id = l.id
+    LEFT JOIN (SELECT location_id, SUM(qty) q FROM reservations WHERE product_id = $1 AND piece_id IS NULL AND status = 'active' GROUP BY 1) r ON r.location_id = l.id
+    ORDER BY 2 DESC, l.id LIMIT 1`, [productId]);
+}
+
+function expectedFrom(product, inc) {
   if (inc) return { date: inc.expected_date, source: inc.kind, qty: inc.qty };
   if (product.made_to_order && product.lead_time_days) {
     const d = new Date(Date.now() + product.lead_time_days * 864e5);
@@ -110,14 +114,42 @@ function classify({ available, reserved, display, damaged }, madeToOrder) {
  * (display pieces count only when explicitly released for sale; damaged never).
  */
 async function productAvailability(db, productId) {
-  const product = await getProduct(db, productId);
-  const locs = await db.query("SELECT * FROM locations ORDER BY CASE type WHEN 'showroom' THEN 0 WHEN 'warehouse' THEN 1 ELSE 2 END, name");
+  const a = (await availabilityMany(db, [productId])).get(Number(productId));
+  if (!a) throw new StockError('Product not found', 404);
+  return a;
+}
+
+/**
+ * Availability for many products in six queries (run in parallel), whatever the
+ * number of products — the network round trip to the database is the slow part.
+ * Returns Map(productId → availability).
+ */
+async function availabilityMany(db, productIds) {
+  const ids = [...new Set(productIds.map(Number).filter(Number.isFinite))];
+  const out = new Map();
+  if (!ids.length) return out;
+  const [products, locs, bal, res, pcs, inc] = await Promise.all([
+    db.query('SELECT id, tracking, made_to_order, lead_time_days FROM products WHERE id = ANY($1)', [ids]),
+    db.query("SELECT * FROM locations ORDER BY CASE type WHEN 'showroom' THEN 0 WHEN 'warehouse' THEN 1 ELSE 2 END, name"),
+    db.query('SELECT product_id, location_id, condition, qty, rack FROM stock_balances WHERE product_id = ANY($1)', [ids]),
+    db.query(`SELECT product_id, location_id, SUM(qty)::int n FROM reservations WHERE product_id = ANY($1) AND piece_id IS NULL AND status = 'active' GROUP BY 1, 2`, [ids]),
+    db.query("SELECT product_id, status, display_for_sale, location_id, rack FROM pieces WHERE product_id = ANY($1) AND status != 'sold'", [ids]),
+    db.query(`SELECT DISTINCT ON (product_id) product_id, kind, qty, expected_date FROM incoming
+      WHERE product_id = ANY($1) AND status IN ('requested','ordered') AND expected_date IS NOT NULL ORDER BY product_id, expected_date`, [ids]),
+  ]);
+  for (const product of products) {
+    out.set(product.id, computeAvailability(product, locs,
+      bal.filter((x) => x.product_id === product.id), res.filter((x) => x.product_id === product.id),
+      pcs.filter((x) => x.product_id === product.id), inc.find((x) => x.product_id === product.id)));
+  }
+  return out;
+}
+
+function computeAvailability(product, locs, bal, res, pieces, inc) {
   const byLocation = [];
   let inTransit = 0;
 
   if (product.tracking === 'sku') {
-    const bal = await db.query('SELECT location_id, condition, qty, rack FROM stock_balances WHERE product_id = $1', [product.id]);
-    const res = await db.query(`SELECT location_id, SUM(qty)::int n FROM reservations WHERE product_id = $1 AND piece_id IS NULL AND status = 'active' GROUP BY location_id`, [product.id]);
     for (const loc of locs) {
       const b = (c) => (bal.find((x) => x.location_id === loc.id && x.condition === c) || { qty: 0 }).qty;
       const sellable = b('sellable'), displaySale = b('display_sale'), display = b('display'), damaged = b('damaged');
@@ -127,7 +159,7 @@ async function productAvailability(db, productId) {
       if (row.physical > 0 || row.reserved > 0) byLocation.push({ location_id: loc.id, location: loc.name, location_code: loc.code, type: loc.type, ...row });
     }
   } else {
-    const all = await db.query("SELECT status, display_for_sale, location_id, rack FROM pieces WHERE product_id = $1 AND status != 'sold'", [product.id]);
+    const all = pieces;
     inTransit = all.filter((p) => p.status === 'in_transit').length;
     for (const loc of locs) {
       const ps = all.filter((p) => p.location_id === loc.id && p.status !== 'in_transit');
@@ -151,7 +183,7 @@ async function productAvailability(db, productId) {
   return {
     product_id: product.id, tracking: product.tracking, totals, byLocation,
     status: classify(totals, product.made_to_order),
-    expected: totals.available > 0 ? null : await expectedAvailability(db, product),
+    expected: totals.available > 0 ? null : expectedFrom(product, inc),
   };
 }
 
@@ -187,12 +219,9 @@ function reserve(db, { productId, pieceId, locationId, qty = 1, customerName, qu
     if (product.tracking === 'piece') throw new StockError('This product is tracked by individual piece — choose the exact piece to reserve', 400);
     const n = posInt(qty);
     let loc = locationId ? Number(locationId) : null;
-    if (!loc) {
-      let best = { id: null, a: -1 };
-      for (const l of await t.query('SELECT id FROM locations')) { const a = await skuAvailableAt(t, product.id, l.id); if (a > best.a) best = { id: l.id, a }; }
-      loc = best.id;
-    }
-    const avail = loc ? await skuAvailableAt(t, product.id, loc) : 0;
+    let avail;
+    if (loc) avail = await skuAvailableAt(t, product.id, loc);
+    else ({ id: loc, available: avail } = (await bestSkuLocation(t, product.id)) || { id: null, available: 0 });
     if (avail < n) throw new StockError(`Only ${avail} available to reserve at this location`);
     const r = await t.one('INSERT INTO reservations (product_id, location_id, qty, customer_name, quotation_id, created_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
       [product.id, loc, n, customerName || null, quotationId || null, userId]);
@@ -372,6 +401,6 @@ function returnInspected(db, { productId, pieceId, locationId, qty = 1, result, 
 }
 
 module.exports = {
-  StockError, inTx, productAvailability, pieceStatus, skuAvailableAt, reserve, releaseReservation,
+  StockError, inTx, productAvailability, availabilityMany, pieceStatus, skuAvailableAt, reserve, releaseReservation,
   receive, transfer, dispatch, count, changeCondition, returnInspected, ledger,
 };

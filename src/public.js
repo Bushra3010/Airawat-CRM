@@ -55,19 +55,23 @@ const publicPhotos = async (db, productId, pieceId) => (await photosFor(db, prod
 
 /** Data for the customer QR page of a product or piece, or null if not public. */
 async function publicItem(db, token) {
-  const s = await settings(db);
-  if (!s.public_pages_enabled || !/^[A-Za-z0-9_-]{8,32}$/.test(String(token))) return null;
-  let product;
-  const piece = await db.one('SELECT * FROM pieces WHERE public_token = $1', [token]);
-  if (piece) {
-    if (!piece.public_enabled) return null;
-    product = await db.one('SELECT * FROM products WHERE id = $1', [piece.product_id]);
-  } else {
-    product = await db.one('SELECT * FROM products WHERE public_token = $1', [token]);
-  }
+  if (!/^[A-Za-z0-9_-]{8,32}$/.test(String(token))) return null;
+  // settings and the token lookup in parallel; the product comes back with a piece match
+  const [s, hit] = await Promise.all([
+    settings(db),
+    db.one(`SELECT row_to_json(pc) AS piece, row_to_json(pr) AS product FROM pieces pc JOIN products pr ON pr.id = pc.product_id WHERE pc.public_token = $1
+      UNION ALL SELECT NULL, row_to_json(pr) FROM products pr WHERE pr.public_token = $1 LIMIT 1`, [token]),
+  ]);
+  if (!s.public_pages_enabled || !hit) return null;
+  const { piece, product } = hit;
+  if (piece && !piece.public_enabled) return null;
   if (!product || !product.public_enabled || !product.active) return null;
 
-  const avail = piece ? null : await inv.productAvailability(db, product.id);
+  const [avail, photos, videos] = await Promise.all([
+    piece ? null : inv.productAvailability(db, product.id),
+    publicPhotos(db, product.id, piece && piece.id),
+    publicVideos(db, product.id, piece && piece.id),
+  ]);
   const status = piece ? inv.pieceStatus(piece) : avail.status;
   // a price implies the item can be bought: hide it for display-only, damaged and sold items
   const showPrice = s.public_show_prices && !!product.public_show_price && !['sold', 'display_only', 'damaged'].includes(status);
@@ -81,8 +85,8 @@ async function publicItem(db, token) {
     price: showPrice && price != null ? price : null,
     availability_text: s.wording[status] || s.wording.out_of_stock,
     expected_date: expected,
-    photos: await publicPhotos(db, product.id, piece && piece.id),
-    videos: await publicVideos(db, product.id, piece && piece.id),
+    photos,
+    videos,
   };
 }
 

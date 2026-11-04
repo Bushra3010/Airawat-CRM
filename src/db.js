@@ -334,9 +334,13 @@ const MIGRATE_LOCK = 4242000;
  * starting together cannot deadlock on ALTER TABLE.
  */
 async function migrate(db) {
-  await db.query('CREATE TABLE IF NOT EXISTS schema_meta (id integer PRIMARY KEY, version text NOT NULL)').catch(() => {});
-  const cur = await db.one('SELECT version FROM schema_meta WHERE id = 1');
+  // usual case: one query says the schema is current
+  const cur = await db.one('SELECT version FROM schema_meta WHERE id = 1').catch((e) => {
+    if (e.code === '42P01') return null;   // schema_meta does not exist yet: fresh database
+    throw e;
+  });
   if (cur && cur.version === SCHEMA_VERSION) return;
+  await db.query('CREATE TABLE IF NOT EXISTS schema_meta (id integer PRIMARY KEY, version text NOT NULL)');
   await db.tx(async (t) => {
     await t.query('SELECT pg_advisory_xact_lock($1)', [MIGRATE_LOCK]);
     const again = await t.one('SELECT version FROM schema_meta WHERE id = 1');

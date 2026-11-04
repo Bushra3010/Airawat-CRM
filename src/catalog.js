@@ -7,14 +7,25 @@ const STATUS_LABEL = {
   made_to_order: 'Made to Order', display_only: 'Display Only', damaged: 'Damaged', sold: 'Sold', in_transit: 'In Transit',
 };
 
+/**
+ * First photo for many products / pieces in one or two queries.
+ * Products fall back to their parent design's photo; pieces fall back to the product's.
+ * Returns { product: Map(productId → url), piece: Map(pieceId → url) }.
+ */
+async function photoMaps(db, productIds, pieceIds = []) {
+  const pids = [...new Set(productIds.map(Number))], cids = [...new Set(pieceIds.filter(Boolean).map(Number))];
+  const [prod, piece] = await Promise.all([
+    pids.length ? db.query(`SELECT DISTINCT ON (pr.id) pr.id AS product_id, ph.url FROM products pr
+      JOIN photos ph ON ph.piece_id IS NULL AND (ph.product_id = pr.id OR ph.product_id = pr.parent_id)
+      WHERE pr.id = ANY($1) ORDER BY pr.id, (ph.product_id = pr.id) DESC, ph.sort, ph.id`, [pids]) : [],
+    cids.length ? db.query('SELECT DISTINCT ON (piece_id) piece_id, url FROM photos WHERE piece_id = ANY($1) ORDER BY piece_id, sort, id', [cids]) : [],
+  ]);
+  return { product: new Map(prod.map((r) => [r.product_id, r.url])), piece: new Map(piece.map((r) => [r.piece_id, r.url])) };
+}
+
 async function primaryPhoto(db, productId, pieceId) {
-  if (pieceId) {
-    const p = await db.one('SELECT url FROM photos WHERE piece_id = $1 ORDER BY sort, id LIMIT 1', [pieceId]);
-    if (p) return p.url;
-  }
-  const p = await db.one('SELECT url FROM photos WHERE product_id = $1 AND piece_id IS NULL ORDER BY sort, id LIMIT 1', [productId])
-    || await db.one('SELECT ph.url FROM photos ph JOIN products pr ON pr.parent_id = ph.product_id WHERE pr.id = $1 AND ph.piece_id IS NULL ORDER BY ph.sort LIMIT 1', [productId]);
-  return p ? p.url : null;
+  const m = await photoMaps(db, [productId], [pieceId]);
+  return m.piece.get(Number(pieceId)) || m.product.get(Number(productId)) || null;
 }
 
 function dims(p) {
@@ -24,23 +35,35 @@ function dims(p) {
 
 const STATUS_RANK = ['available_now', 'made_to_order', 'reserved', 'display_only', 'damaged', 'out_of_stock'];
 
+/** Photo cards for many product rows with a fixed number of queries. */
+async function cardsFor(db, rows) {
+  if (!rows.length) return [];
+  const ids = rows.map((p) => p.id);
+  const kids = await db.query('SELECT id, parent_id FROM products WHERE parent_id = ANY($1) AND active = 1', [ids]);
+  const [avail, photos] = await Promise.all([availabilityMany(db, [...ids, ...kids.map((k) => k.id)]), photoMaps(db, ids)]);
+  return rows.map((p) => {
+    const a = avail.get(p.id);
+    let { status } = a, available = a.totals.available, variants = 0;
+    // A design with variants and no stock of its own shows the best status of its variants.
+    const mine = kids.filter((k) => k.parent_id === p.id);
+    if (mine.length && a.totals.physical === 0) {
+      const ka = mine.map((k) => avail.get(k.id));
+      available = ka.reduce((s, x) => s + x.totals.available, 0);
+      status = ka.map((x) => x.status).sort((x, y) => STATUS_RANK.indexOf(x) - STATUS_RANK.indexOf(y))[0];
+      variants = mine.length;
+    }
+    return {
+      variants,
+      id: p.id, sku: p.sku, name: p.name, variant_label: p.variant_label, category: p.category, material: p.material, finish: p.finish,
+      dimensions: dims(p), selling_price: p.selling_price, tracking: p.tracking, photo: photos.product.get(p.id) || null,
+      status, status_label: STATUS_LABEL[status], available, expected: a.expected,
+    };
+  });
+}
+const availabilityMany = (db, ids) => inv.availabilityMany(db, ids);
+
 async function card(db, p) {
-  const a = await inv.productAvailability(db, p.id);
-  // A design with variants and no stock of its own shows the best status of its variants.
-  const kids = await db.query('SELECT id FROM products WHERE parent_id = $1 AND active = 1', [p.id]);
-  let variants = 0;
-  if (kids.length && a.totals.physical === 0) {
-    const ka = await Promise.all(kids.map((k) => inv.productAvailability(db, k.id)));
-    a.totals.available = ka.reduce((s, x) => s + x.totals.available, 0);
-    a.status = ka.map((x) => x.status).sort((x, y) => STATUS_RANK.indexOf(x) - STATUS_RANK.indexOf(y))[0];
-    variants = kids.length;
-  }
-  return {
-    variants,
-    id: p.id, sku: p.sku, name: p.name, variant_label: p.variant_label, category: p.category, material: p.material, finish: p.finish,
-    dimensions: dims(p), selling_price: p.selling_price, tracking: p.tracking, photo: await primaryPhoto(db, p.id),
-    status: a.status, status_label: STATUS_LABEL[a.status], available: a.totals.available, expected: a.expected,
-  };
+  return (await cardsFor(db, [p]))[0];
 }
 
 /**
@@ -70,14 +93,17 @@ async function search(db, { q = '', category, material, finish, availability, li
   }
   for (const [k, v] of Object.entries({ category, material, finish })) if (v) where.push(`pr.${k} = ${p(v)}`);
   const rows = await db.query(`SELECT pr.* FROM products pr WHERE ${where.join(' AND ')} ORDER BY pr.name LIMIT 500`, params);
-  let cards = await Promise.all(rows.map((r) => card(db, r)));
+  let cards = await cardsFor(db, rows);
   if (availability) cards = cards.filter((c) => c.status === availability);
   return cards.slice(0, Number(limit) || 60);
 }
 
 async function facets(db) {
-  const col = async (c) => (await db.query(`SELECT DISTINCT ${c} v FROM products WHERE active = 1 AND ${c} IS NOT NULL ORDER BY ${c}`)).map((r) => r.v);
-  return { categories: await col('category'), materials: await col('material'), finishes: await col('finish') };
+  const rows = await db.query(`SELECT array_agg(DISTINCT category) FILTER (WHERE category IS NOT NULL) AS categories,
+    array_agg(DISTINCT material) FILTER (WHERE material IS NOT NULL) AS materials,
+    array_agg(DISTINCT finish) FILTER (WHERE finish IS NOT NULL) AS finishes FROM products WHERE active = 1`);
+  const sorted = (a) => (a || []).sort((x, y) => x.localeCompare(y));
+  return { categories: sorted(rows[0].categories), materials: sorted(rows[0].materials), finishes: sorted(rows[0].finishes) };
 }
 
 /**
@@ -113,12 +139,14 @@ async function resolveCode(db, raw) {
  * overrides_parent hides inherited videos of the same type.
  */
 async function videosFor(db, { productId, pieceId }, { includeInternal = true } = {}) {
-  const product = await db.one('SELECT id, parent_id FROM products WHERE id = $1', [productId]);
-  if (!product) return [];
+  // one query: this piece's videos, this product's, and the parent design's
+  const rows = await db.query(`SELECT v.* FROM videos v WHERE (v.piece_id IS NOT NULL AND v.piece_id = $2)
+    OR (v.piece_id IS NULL AND (v.product_id = $1 OR v.product_id = (SELECT parent_id FROM products WHERE id = $1))) ORDER BY v.id`,
+  [Number(productId), pieceId ? Number(pieceId) : null]);
   const levels = [];
-  if (pieceId) levels.push({ rows: await db.query('SELECT * FROM videos WHERE piece_id = $1 ORDER BY id', [pieceId]), scope: 'exact_piece' });
-  levels.push({ rows: await db.query('SELECT * FROM videos WHERE product_id = $1 AND piece_id IS NULL ORDER BY id', [product.id]), scope: pieceId ? 'same_design' : 'this_product' });
-  if (product.parent_id) levels.push({ rows: await db.query('SELECT * FROM videos WHERE product_id = $1 AND piece_id IS NULL ORDER BY id', [product.parent_id]), scope: 'same_design' });
+  if (pieceId) levels.push({ rows: rows.filter((v) => v.piece_id), scope: 'exact_piece' });
+  levels.push({ rows: rows.filter((v) => !v.piece_id && v.product_id === Number(productId)), scope: pieceId ? 'same_design' : 'this_product' });
+  levels.push({ rows: rows.filter((v) => !v.piece_id && v.product_id !== Number(productId)), scope: 'same_design' });
 
   const out = [];
   const overridden = new Set();
@@ -144,26 +172,27 @@ async function videosFor(db, { productId, pieceId }, { includeInternal = true } 
   return out.sort((a, b) => b.is_primary - a.is_primary);
 }
 
+/** Photos for a product (and one exact piece) in one query; a variant without its own photos uses its design's. */
 async function photosFor(db, productId, pieceId, publicOnly = false) {
-  const pub = publicOnly ? 'AND is_public = 1' : '';
-  const piecePhotos = pieceId ? await db.query(`SELECT id, url, caption, is_public, 1 AS exact_piece FROM photos WHERE piece_id = $1 ${pub} ORDER BY sort, id`, [pieceId]) : [];
-  let design = await db.query(`SELECT id, url, caption, is_public, 0 AS exact_piece FROM photos WHERE product_id = $1 AND piece_id IS NULL ${pub} ORDER BY sort, id`, [productId]);
-  if (!design.length) {
-    const parent = await db.one('SELECT parent_id FROM products WHERE id = $1', [productId]);
-    if (parent && parent.parent_id) design = await db.query(`SELECT id, url, caption, is_public, 0 AS exact_piece FROM photos WHERE product_id = $1 AND piece_id IS NULL ${pub} ORDER BY sort, id`, [parent.parent_id]);
-  }
-  return [...piecePhotos, ...design];
+  const rows = await db.query(`SELECT id, url, caption, is_public, product_id, piece_id FROM photos
+    WHERE ((piece_id IS NOT NULL AND piece_id = $2) OR (piece_id IS NULL AND (product_id = $1 OR product_id = (SELECT parent_id FROM products WHERE id = $1))))
+    ${publicOnly ? 'AND is_public = 1' : ''} ORDER BY sort, id`, [Number(productId), pieceId ? Number(pieceId) : null]);
+  const shape = (r, exact) => ({ id: r.id, url: r.url, caption: r.caption, is_public: r.is_public, exact_piece: exact });
+  const own = rows.filter((r) => !r.piece_id && r.product_id === Number(productId));
+  const design = own.length ? own : rows.filter((r) => !r.piece_id && r.product_id !== Number(productId));
+  return [...rows.filter((r) => r.piece_id).map((r) => shape(r, 1)), ...design.map((r) => shape(r, 0))];
 }
 
 /** Similar products that are available now: same category, closest price/size/material. */
-async function alternatives(db, productId, limit = 6) {
-  const p = await db.one('SELECT * FROM products WHERE id = $1', [productId]);
+async function alternatives(db, productId, limit = 6, product) {
+  const p = product || await db.one('SELECT * FROM products WHERE id = $1', [productId]);
   if (!p) return [];
   const cands = await db.query('SELECT * FROM products WHERE active = 1 AND id != $1 AND (category = $2 OR parent_id = $1 OR id = $3 OR parent_id = $3)',
     [p.id, p.category, p.parent_id || -1]);
+  const cards = await cardsFor(db, cands);
   const scored = [];
-  for (const c of cands) {
-    const cc = await card(db, c);
+  for (const [i, c] of cands.entries()) {
+    const cc = cards[i];
     if (cc.status !== 'available_now') continue;
     let score = 0;
     if (p.parent_id && (c.parent_id === p.parent_id || c.id === p.parent_id)) score += 5;
@@ -176,18 +205,24 @@ async function alternatives(db, productId, limit = 6) {
   return scored.sort((a, b) => b.score - a.score).slice(0, limit);
 }
 
-async function pieceView(db, piece, { includeCost }) {
-  const loc = piece.location_id ? await db.one('SELECT name, type, code FROM locations WHERE id = $1', [piece.location_id]) : null;
-  const res = await db.one("SELECT r.id, r.customer_name, r.created_at, u.name AS by_name FROM reservations r LEFT JOIN users u ON u.id = r.created_by WHERE r.piece_id = $1 AND r.status = 'active'", [piece.id]);
+// Pieces with their location, active reservation and first photo, in one query.
+const PIECE_ROWS = `SELECT pc.*, l.name AS loc_name, l.type AS loc_type,
+    r.id AS res_id, r.customer_name AS res_customer, r.created_at AS res_at, u.name AS res_by,
+    (SELECT url FROM photos ph WHERE ph.piece_id = pc.id ORDER BY sort, id LIMIT 1) AS piece_photo
+  FROM pieces pc LEFT JOIN locations l ON l.id = pc.location_id
+  LEFT JOIN reservations r ON r.piece_id = pc.id AND r.status = 'active' LEFT JOIN users u ON u.id = r.created_by`;
+
+function pieceView(piece, { includeCost }, designPhoto = null) {
   const status = inv.pieceStatus(piece);
   return {
     id: piece.id, piece_code: piece.piece_code, mfr_barcode: piece.mfr_barcode, condition: piece.condition, finish_note: piece.finish_note,
-    location_id: piece.location_id, location: loc && loc.name, location_type: loc && loc.type, rack: piece.rack,
+    location_id: piece.location_id, location: piece.loc_name || null, location_type: piece.loc_type || null, rack: piece.rack,
     status, status_label: STATUS_LABEL[status], raw_status: piece.status,
     display_piece: piece.status === 'display', display_for_sale: !!piece.display_for_sale,
     selling_price: piece.selling_price, cost_price: includeCost ? piece.cost_price : undefined,
     public_enabled: !!piece.public_enabled, public_token: piece.public_token, notes: includeCost ? piece.notes : undefined,
-    reservation: res || null, photo: await primaryPhoto(db, piece.product_id, piece.id),
+    reservation: piece.res_id ? { id: piece.res_id, customer_name: piece.res_customer, created_at: piece.res_at, by_name: piece.res_by } : null,
+    photo: piece.piece_photo || designPhoto,
   };
 }
 
@@ -195,16 +230,26 @@ async function pieceView(db, piece, { includeCost }) {
 async function productDetail(db, productId, { includeCost = false } = {}) {
   const p = await db.one('SELECT * FROM products WHERE id = $1', [productId]);
   if (!p) return null;
-  const availability = await inv.productAvailability(db, p.id);
-  const pieces = p.tracking === 'piece'
-    ? await Promise.all((await db.query("SELECT * FROM pieces WHERE product_id = $1 ORDER BY CASE status WHEN 'available' THEN 0 WHEN 'display' THEN 1 WHEN 'reserved' THEN 2 WHEN 'damaged' THEN 3 ELSE 4 END, piece_code", [p.id])).map((x) => pieceView(db, x, { includeCost })))
-    : [];
-  const variantRows = await db.query('SELECT * FROM products WHERE active = 1 AND id != $1 AND ((parent_id IS NOT NULL AND parent_id = $2) OR parent_id = $1 OR id = $2)', [p.id, p.parent_id || -1]);
-  const variants = await Promise.all(variantRows.map((v) => card(db, v)));
-  const reservations = await db.query(`SELECT r.*, l.name AS location, u.name AS by_name, pc.piece_code FROM reservations r
-    LEFT JOIN locations l ON l.id = r.location_id LEFT JOIN users u ON u.id = r.created_by LEFT JOIN pieces pc ON pc.id = r.piece_id
-    WHERE r.product_id = $1 AND r.status = 'active' ORDER BY r.created_at DESC`, [p.id]);
-  const incoming = await db.query("SELECT * FROM incoming WHERE product_id = $1 AND status IN ('requested','ordered') ORDER BY expected_date", [p.id]);
+  // Everything else depends only on the product row: fetch it all in parallel.
+  const [availability, pieceRows, variantRows, reservations, incoming, photos, videos, design] = await Promise.all([
+    inv.productAvailability(db, p.id),
+    p.tracking === 'piece' ? db.query(`${PIECE_ROWS} WHERE pc.product_id = $1
+      ORDER BY CASE pc.status WHEN 'available' THEN 0 WHEN 'display' THEN 1 WHEN 'reserved' THEN 2 WHEN 'damaged' THEN 3 ELSE 4 END, pc.piece_code`, [p.id]) : [],
+    db.query('SELECT * FROM products WHERE active = 1 AND id != $1 AND ((parent_id IS NOT NULL AND parent_id = $2) OR parent_id = $1 OR id = $2)', [p.id, p.parent_id || -1]),
+    db.query(`SELECT r.*, l.name AS location, u.name AS by_name, pc.piece_code FROM reservations r
+      LEFT JOIN locations l ON l.id = r.location_id LEFT JOIN users u ON u.id = r.created_by LEFT JOIN pieces pc ON pc.id = r.piece_id
+      WHERE r.product_id = $1 AND r.status = 'active' ORDER BY r.created_at DESC`, [p.id]),
+    db.query("SELECT * FROM incoming WHERE product_id = $1 AND status IN ('requested','ordered') ORDER BY expected_date", [p.id]),
+    photosFor(db, p.id),
+    videosFor(db, { productId: p.id }),
+    photoMaps(db, [p.id]),
+  ]);
+  const designPhoto = design.product.get(p.id) || null;
+  const pieces = pieceRows.map((x) => pieceView(x, { includeCost }, designPhoto));
+  const [variants, alts] = await Promise.all([
+    cardsFor(db, variantRows),
+    availability.status === 'available_now' ? [] : alternatives(db, p.id, 6, p),
+  ]);
   const out = {
     id: p.id, sku: p.sku, internal_code: p.internal_code, mfr_barcode: p.mfr_barcode, name: p.name, variant_label: p.variant_label, parent_id: p.parent_id,
     category: p.category, material: p.material, finish: p.finish, length_cm: p.length_cm, width_cm: p.width_cm, height_cm: p.height_cm,
@@ -212,29 +257,34 @@ async function productDetail(db, productId, { includeCost = false } = {}) {
     tracking: p.tracking, made_to_order: !!p.made_to_order, lead_time_days: p.lead_time_days,
     public_enabled: !!p.public_enabled, public_show_price: !!p.public_show_price, public_token: p.public_token,
     status_label: STATUS_LABEL[availability.status], availability, pieces, variants, reservations, incoming,
-    photos: await photosFor(db, p.id), videos: await videosFor(db, { productId: p.id }),
-    alternatives: availability.status === 'available_now' ? [] : await alternatives(db, p.id),
+    photos, videos, alternatives: alts,
   };
   if (includeCost) Object.assign(out, { cost_price: p.cost_price, vendor: p.vendor, internal_notes: p.internal_notes });
   return out;
 }
 
 async function pieceDetail(db, pieceId, opts = {}) {
-  const piece = await db.one('SELECT * FROM pieces WHERE id = $1', [pieceId]);
+  const piece = await db.one('SELECT id, product_id FROM pieces WHERE id = $1', [pieceId]);
   if (!piece) return null;
-  const product = await productDetail(db, piece.product_id, opts);
-  const history = await db.query(`SELECT sl.ts, sl.movement, sl.qty, sl.condition, sl.reference, sl.note, fl.name AS from_loc, tl.name AS to_loc, u.name AS by_name
-    FROM stock_ledger sl LEFT JOIN locations fl ON fl.id = sl.from_location_id LEFT JOIN locations tl ON tl.id = sl.to_location_id
-    LEFT JOIN users u ON u.id = sl.user_id WHERE sl.piece_id = $1 ORDER BY sl.id DESC`, [pieceId]);
-  const view = await pieceView(db, piece, opts);
-  const alts = view.status === 'available_now' ? [] : [
-    ...product.pieces.filter((x) => x.id !== piece.id && x.status === 'available_now').slice(0, 4).map((x) => ({ ...x, kind: 'piece', name: product.name })),
-    ...(await alternatives(db, piece.product_id, 4)).map((x) => ({ ...x, kind: 'product' })),
-  ];
-  return {
-    piece: view, product, history, alternatives: alts,
-    photos: await photosFor(db, piece.product_id, piece.id), videos: await videosFor(db, { productId: piece.product_id, pieceId }),
-  };
+  const [product, history, photos, videos] = await Promise.all([
+    productDetail(db, piece.product_id, opts),
+    db.query(`SELECT sl.ts, sl.movement, sl.qty, sl.condition, sl.reference, sl.note, fl.name AS from_loc, tl.name AS to_loc, u.name AS by_name
+      FROM stock_ledger sl LEFT JOIN locations fl ON fl.id = sl.from_location_id LEFT JOIN locations tl ON tl.id = sl.to_location_id
+      LEFT JOIN users u ON u.id = sl.user_id WHERE sl.piece_id = $1 ORDER BY sl.id DESC`, [pieceId]),
+    photosFor(db, piece.product_id, piece.id),
+    videosFor(db, { productId: piece.product_id, pieceId }),
+  ]);
+  const view = product.pieces.find((x) => x.id === piece.id);
+  let alts = [];
+  if (view.status !== 'available_now') {
+    // the product page already worked out alternatives when the design has none free
+    const otherProducts = product.alternatives.length ? product.alternatives : await alternatives(db, piece.product_id, 4);
+    alts = [
+      ...product.pieces.filter((x) => x.id !== piece.id && x.status === 'available_now').slice(0, 4).map((x) => ({ ...x, kind: 'piece', name: product.name })),
+      ...otherProducts.slice(0, 4).map((x) => ({ ...x, kind: 'product' })),
+    ];
+  }
+  return { piece: view, product, history, alternatives: alts, photos, videos };
 }
 
-module.exports = { search, facets, resolveCode, videosFor, photosFor, alternatives, productDetail, pieceDetail, card, dims, STATUS_LABEL, primaryPhoto };
+module.exports = { search, facets, resolveCode, videosFor, photosFor, alternatives, productDetail, pieceDetail, card, cardsFor, photoMaps, dims, STATUS_LABEL, primaryPhoto };

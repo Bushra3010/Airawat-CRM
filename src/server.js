@@ -472,13 +472,24 @@ function createApp({ db, uploadDir = path.join(__dirname, '..', 'data', 'uploads
   async function shortlistItems(id) {
     const rows = await db.query(`SELECT si.*, p.name, p.sku, p.variant_label, p.material, p.finish, p.length_cm, p.width_cm, p.height_cm, p.selling_price, p.tracking,
       pc.piece_code, pc.selling_price AS piece_price FROM shortlist_items si JOIN products p ON p.id = si.product_id LEFT JOIN pieces pc ON pc.id = si.piece_id WHERE si.shortlist_id = $1 ORDER BY si.id`, [id]);
-    return Promise.all(rows.map(async (it) => {
-      const a = await inv.productAvailability(db, it.product_id);
-      const pieceRow = it.piece_id && await db.one('SELECT * FROM pieces WHERE id = $1', [it.piece_id]);
+    const { avail, pieces, photos } = await lineContext(db, rows);
+    return rows.map((it) => {
+      const a = avail.get(it.product_id);
+      const pieceRow = it.piece_id && pieces.get(it.piece_id);
       const status = pieceRow ? inv.pieceStatus(pieceRow) : a.status;
-      return { ...it, dimensions: catalog.dims(it), price: it.piece_price ?? it.selling_price, photo: await catalog.primaryPhoto(db, it.product_id, it.piece_id),
+      return { ...it, dimensions: catalog.dims(it), price: it.piece_price ?? it.selling_price, photo: photos.piece.get(it.piece_id) || photos.product.get(it.product_id) || null,
         status, status_label: catalog.STATUS_LABEL[status], available: pieceRow ? (status === 'available_now' ? 1 : 0) : a.totals.available };
-    }));
+    });
+  }
+  /** Availability, piece rows and photos for a list of shortlist / quotation lines, in a few batched queries. */
+  async function lineContext(t, rows) {
+    const productIds = rows.map((r) => r.product_id), pieceIds = rows.map((r) => r.piece_id).filter(Boolean);
+    const [avail, pieceRows, photos] = await Promise.all([
+      inv.availabilityMany(t, productIds),
+      pieceIds.length ? t.query('SELECT * FROM pieces WHERE id = ANY($1)', [pieceIds]) : [],
+      catalog.photoMaps(t, productIds, pieceIds),
+    ]);
+    return { avail, pieces: new Map(pieceRows.map((p) => [p.id, p])), photos };
   }
   api.get('/shortlists', need('quote'), wrap(() => db.query(`SELECT s.*, u.name AS by_name, (SELECT COUNT(*) FROM shortlist_items WHERE shortlist_id = s.id) AS items
     FROM shortlists s LEFT JOIN users u ON u.id = s.created_by ORDER BY s.id DESC LIMIT 100`)));
@@ -542,19 +553,22 @@ function createApp({ db, uploadDir = path.join(__dirname, '..', 'data', 'uploads
   async function quotationView(t, id) {
     const q = await t.one('SELECT q.*, u.name AS by_name FROM quotations q LEFT JOIN users u ON u.id = q.created_by WHERE q.id = $1', [id]);
     if (!q) throw fail('Quotation not found', 404);
-    const rows = await t.query(`SELECT qi.*, p.name, p.sku, p.variant_label, p.tracking, p.made_to_order, pc.piece_code FROM quotation_items qi JOIN products p ON p.id = qi.product_id
-      LEFT JOIN pieces pc ON pc.id = qi.piece_id WHERE qi.quotation_id = $1 ORDER BY qi.id`, [id]);
-    const items = [];
-    for (const it of rows) {
-      const piece = it.piece_id && await t.one('SELECT * FROM pieces WHERE id = $1', [it.piece_id]);
-      const a = await inv.productAvailability(t, it.product_id);
+    const [rows, allRes] = await Promise.all([
+      t.query(`SELECT qi.*, p.name, p.sku, p.variant_label, p.tracking, p.made_to_order, pc.piece_code FROM quotation_items qi JOIN products p ON p.id = qi.product_id
+        LEFT JOIN pieces pc ON pc.id = qi.piece_id WHERE qi.quotation_id = $1 ORDER BY qi.id`, [id]),
+      t.query("SELECT id, qty, location_id, product_id, piece_id FROM reservations WHERE quotation_id = $1 AND status = 'active'", [id]),
+    ]);
+    const { avail, pieces, photos } = await lineContext(t, rows);
+    const items = rows.map((it) => {
+      const piece = it.piece_id && pieces.get(it.piece_id);
+      const a = avail.get(it.product_id);
       const status = piece ? inv.pieceStatus(piece) : a.status;
-      const resv = await t.query("SELECT id, qty, location_id FROM reservations WHERE quotation_id = $1 AND product_id = $2 AND COALESCE(piece_id,0) = $3 AND status = 'active'", [id, it.product_id, it.piece_id || 0]);
+      const resv = allRes.filter((r) => r.product_id === it.product_id && (r.piece_id || 0) === (it.piece_id || 0)).map(({ id: rid, qty, location_id }) => ({ id: rid, qty, location_id }));
       const heldByThis = resv.reduce((s, r) => s + r.qty, 0);
       const canFulfil = heldByThis >= it.qty || (piece ? status === 'available_now' : a.totals.available >= it.qty);
-      items.push({ ...it, status, status_label: catalog.STATUS_LABEL[status], available: piece ? (status === 'available_now' ? 1 : 0) : a.totals.available,
-        reservations: resv, can_fulfil: canFulfil, needs_piece: it.tracking === 'piece' && !it.piece_id, photo: await catalog.primaryPhoto(t, it.product_id, it.piece_id) });
-    }
+      return { ...it, status, status_label: catalog.STATUS_LABEL[status], available: piece ? (status === 'available_now' ? 1 : 0) : a.totals.available,
+        reservations: resv, can_fulfil: canFulfil, needs_piece: it.tracking === 'piece' && !it.piece_id, photo: photos.piece.get(it.piece_id) || photos.product.get(it.product_id) || null };
+    });
     return { ...q, items, total: items.reduce((s, i) => s + i.qty * i.unit_price, 0) };
   }
   const editableQuote = async (qid) => {
@@ -597,25 +611,30 @@ function createApp({ db, uploadDir = path.join(__dirname, '..', 'data', 'uploads
   api.post('/quotations/:id/confirm', need('reserve'), confirmed, wrap(async (req) => {
     const id = Number(req.params.id);
     return db.tx(async (t) => {
+      // One transaction for every line: any problem rolls all reservations back, so
+      // per-line savepoints are not needed (stock checks throw before writing).
       t.inTx = true;
+      t.noSavepoints = true;
       const q = await t.one('SELECT * FROM quotations WHERE id = $1 FOR UPDATE', [id]);
       if (!q) throw fail('Quotation not found', 404);
       if (!['draft', 'sent'].includes(q.status)) throw fail('Quotation is already ' + q.status, 409);
-      const view = await quotationView(t, id);
-      if (!view.items.length) throw fail('Quotation has no items');
+      const items = await t.query(`SELECT qi.product_id, qi.piece_id, qi.qty, p.name, p.tracking, pc.piece_code FROM quotation_items qi
+        JOIN products p ON p.id = qi.product_id LEFT JOIN pieces pc ON pc.id = qi.piece_id WHERE qi.quotation_id = $1 ORDER BY qi.id`, [id]);
+      if (!items.length) throw fail('Quotation has no items');
       const problems = [];
-      for (const it of view.items) {
-        if (it.needs_piece) { problems.push(`${it.name}: choose the exact piece`); continue; }
+      for (const it of items) {
+        if (it.tracking === 'piece' && !it.piece_id) { problems.push(`${it.name}: choose the exact piece`); continue; }
         try {
           await inv.reserve(t, { productId: it.product_id, pieceId: it.piece_id, qty: it.qty, customerName: q.customer_name, quotationId: id, userId: uid(req) });
         } catch (e) {
           if (!e.status && e.code !== '23505') throw e;
           problems.push(`${it.name}${it.piece_code ? ` (${it.piece_code})` : ''}: ${e.code === '23505' ? 'just reserved by someone else' : e.message}`);
+          if (e.code === '23505') break;   // the transaction is aborted; nothing more can run in it
         }
       }
       if (problems.length) throw Object.assign(fail(`Cannot confirm — ${problems.join('; ')}`, 409), { problems });
       await t.query("UPDATE quotations SET kind = 'order', status = 'confirmed' WHERE id = $1", [id]);
-      return quotationView(t, id);
+      return { id, number: q.number, kind: 'order', status: 'confirmed' };
     });
   }));
   api.post('/quotations/:id/cancel', need('reserve'), confirmed, wrap(async (req) => {

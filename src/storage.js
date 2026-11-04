@@ -39,7 +39,12 @@ async function savePhoto(buf, ext, { uploadDir }) {
   const sb = supabase();
   if (sb) {
     const type = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
-    const r = await fetch(`${sb.url}/storage/v1/object/${BUCKET}/${name}`, { method: 'POST', headers: headers(sb.key, { 'Content-Type': type, 'x-upsert': 'false' }), body: buf });
+    const upload = () => fetch(`${sb.url}/storage/v1/object/${BUCKET}/${name}`, { method: 'POST', headers: headers(sb.key, { 'Content-Type': type, 'x-upsert': 'false' }), body: buf });
+    let r = await upload();
+    if (r.status === 404 || r.status === 400) {   // bucket missing (e.g. deleted in the dashboard): recreate once
+      await ensureBucket();
+      r = await upload();
+    }
     if (!r.ok) throw Object.assign(new Error(`Photo upload failed (${r.status})`), { status: 502 });
     return { url: `${sb.url}/storage/v1/object/public/${BUCKET}/${name}`, storage_path: name };
   }

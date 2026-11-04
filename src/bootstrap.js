@@ -59,6 +59,8 @@ function ensureReady(db, opts = {}) {
     };
     ready = (async () => {
       await migrate(db);
+      // already set up (the usual cold start): one query, no transaction
+      if (await db.one('SELECT 1 FROM users LIMIT 1')) return;
       await require('./storage').ensureBucket().catch((e) => console.error(e.message));
       await firstRun(db, o);
     })();
