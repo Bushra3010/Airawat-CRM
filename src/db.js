@@ -273,11 +273,31 @@ function wrap(runner) {
   };
 }
 
+/**
+ * Connection settings from a postgres:// URL. Passwords copied from the Supabase
+ * dashboard often contain characters (# % / ? …) that are not URL-encoded and make
+ * standard URL parsing fail, so fall back to splitting at the last "@".
+ */
+function connectionConfig(connectionString) {
+  const s = String(connectionString).trim();
+  if (!/^postgres(ql)?:\/\//i.test(s)) throw new Error('DATABASE_URL is not a valid postgres connection string (it should start with postgresql://)');
+  try {
+    new URL(s);
+    return { connectionString: s };
+  } catch { /* fall through to manual parsing */ }
+  const m = s.match(/^postgres(?:ql)?:\/\/([^:@/]+):(.*)@([^@/:?#]+)(?::(\d+))?\/([^?#]*)(?:\?(.*))?$/);
+  if (!m) throw new Error('DATABASE_URL is not a valid postgres connection string');
+  let password = m[2];
+  try { password = decodeURIComponent(password); } catch { /* use as typed */ }
+  return { user: decodeURIComponent(m[1]), password, host: m[3], port: Number(m[4] || 5432), database: decodeURIComponent(m[5] || 'postgres') };
+}
+
 function open(connectionString = process.env.DATABASE_URL, { max = Number(process.env.DB_POOL_MAX || 3), ssl } = {}) {
   if (!connectionString) throw new Error('DATABASE_URL is not set (use your Supabase connection string)');
-  const local = /@(localhost|127\.0\.0\.1)[:/]/.test(connectionString);
+  const conn = connectionConfig(connectionString);
+  const local = conn.host ? /^(localhost|127\.0\.0\.1)$/.test(conn.host) : /@(localhost|127\.0\.0\.1)[:/]/.test(connectionString);
   const pool = new pg.Pool({
-    connectionString,
+    ...conn,
     max,
     idleTimeoutMillis: 10_000,
     // Supabase requires TLS. Its certificate chain is not in Node's default store, so
@@ -310,4 +330,4 @@ async function migrate(db) {
   await db.query(LOCKDOWN);
 }
 
-module.exports = { open, migrate, TABLES };
+module.exports = { open, migrate, connectionConfig, TABLES };

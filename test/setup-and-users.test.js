@@ -118,3 +118,11 @@ test('repeated wrong passwords lock that username for 15 minutes', async () => {
   await db.query("UPDATE login_failures SET ts = ts - interval '16 minutes'");
   assert.equal((await login('admin', ADMIN_PW)).status, 200, 'unlocked after 15 minutes');
 });
+
+test('database URLs with un-encoded special characters in the password are accepted', () => {
+  const { connectionConfig } = require('../src/db');
+  const c = connectionConfig('postgresql://postgres.abcref:Pa#ss%w/o?r@d!@aws-0-ap-southeast-2.pooler.supabase.com:6543/postgres');
+  assert.deepEqual(c, { user: 'postgres.abcref', password: 'Pa#ss%w/o?r@d!', host: 'aws-0-ap-southeast-2.pooler.supabase.com', port: 6543, database: 'postgres' });
+  assert.deepEqual(connectionConfig('postgres://u:p%40ss@localhost:5432/db'), { connectionString: 'postgres://u:p%40ss@localhost:5432/db' });
+  assert.throws(() => connectionConfig('https://abc.supabase.co'), /not a valid postgres/);
+});
