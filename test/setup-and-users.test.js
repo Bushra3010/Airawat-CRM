@@ -126,3 +126,18 @@ test('database URLs with un-encoded special characters in the password are accep
   assert.deepEqual(connectionConfig('postgres://u:p%40ss@localhost:5432/db'), { connectionString: 'postgres://u:p%40ss@localhost:5432/db' });
   assert.throws(() => connectionConfig('https://abc.supabase.co'), /not a valid postgres/);
 });
+
+test('instances starting at the same time migrate without deadlocking', async () => {
+  const { migrate } = require('../src/db');
+  await db.query('DELETE FROM schema_meta');   // force a re-run of the migration
+  const pools = Array.from({ length: 4 }, () => open(pg.url, { max: 2 }));
+  try {
+    await Promise.all(pools.map((p) => migrate(p)));
+    assert.equal((await db.one('SELECT COUNT(*)::int n FROM schema_meta')).n, 1);
+    const t = Date.now();
+    await migrate(db);
+    assert.ok(Date.now() - t < 200, 'already-migrated database is skipped quickly');
+  } finally {
+    await Promise.all(pools.map((p) => p.close()));
+  }
+});

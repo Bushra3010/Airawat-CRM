@@ -325,9 +325,27 @@ function open(connectionString = process.env.DATABASE_URL, { max = Number(proces
   return db;
 }
 
+const SCHEMA_VERSION = require('crypto').createHash('sha256').update(SCHEMA + LOCKDOWN).digest('hex').slice(0, 16);
+const MIGRATE_LOCK = 4242000;
+
+/**
+ * Create/update tables. Skipped with one cheap query when the database already has
+ * this schema version; otherwise serialised with an advisory lock so instances
+ * starting together cannot deadlock on ALTER TABLE.
+ */
 async function migrate(db) {
-  await db.query(SCHEMA);
-  await db.query(LOCKDOWN);
+  await db.query('CREATE TABLE IF NOT EXISTS schema_meta (id integer PRIMARY KEY, version text NOT NULL)').catch(() => {});
+  const cur = await db.one('SELECT version FROM schema_meta WHERE id = 1');
+  if (cur && cur.version === SCHEMA_VERSION) return;
+  await db.tx(async (t) => {
+    await t.query('SELECT pg_advisory_xact_lock($1)', [MIGRATE_LOCK]);
+    const again = await t.one('SELECT version FROM schema_meta WHERE id = 1');
+    if (again && again.version === SCHEMA_VERSION) return;
+    await t.query(SCHEMA);
+    await t.query(LOCKDOWN);
+    await t.query('ALTER TABLE schema_meta ENABLE ROW LEVEL SECURITY');
+    await t.query('INSERT INTO schema_meta (id, version) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version', [SCHEMA_VERSION]);
+  });
 }
 
 module.exports = { open, migrate, connectionConfig, TABLES };
