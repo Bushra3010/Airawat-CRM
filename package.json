@@ -22,7 +22,9 @@
   },
   "devDependencies": {
     "embedded-postgres": "^17.5.0-beta.15",
-    "jsqr": "^1.4.0"
+    "esbuild": "^0.25.12",
+    "jsqr": "^1.4.0",
+    "wrangler": "4.86.0"
   },
   "private": true,
   "engines": {

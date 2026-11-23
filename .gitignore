@@ -6,3 +6,6 @@ certs/
 .env
 public/vendor/
 .netlify/
+.wrangler/
+.dev.vars
+dist/

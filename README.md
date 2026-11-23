@@ -20,7 +20,23 @@ npm start            # http://localhost:3000 — without DATABASE_URL it runs a 
 npm test             # verification suite (starts its own throwaway Postgres)
 ```
 
-## Deploy: Netlify + Supabase
+## Deploy: Cloudflare Workers + Supabase (current)
+
+Live at **https://airawat-showroom.airawat565.workers.dev**. Static files in `public/` are served by Workers Static Assets;
+`/api/*`, `/p/*` and `/c/*` run the same Express app in a Worker (`worker/index.js`, bundled by `scripts/build-worker.js`).
+The Worker reaches Supabase through a **Hyperdrive** config (`airawat-db`, caching disabled), because Workers' own TLS
+upgrade fails against Supabase's pooler.
+
+1. `npx wrangler login` (Cloudflare account airawat565).
+2. Secrets, once: `npx wrangler secret put SUPABASE_URL` and `npx wrangler secret put SUPABASE_SERVICE_ROLE_KEY`.
+   The database password lives in the Hyperdrive config; if you reset it in Supabase, update it with
+   `npx wrangler hyperdrive update d97af0511e2b4bf3b74445e3904b7c2a --origin-password=<new password>`.
+3. `npx wrangler deploy` (builds and uploads). Logs: `npx wrangler tail`.
+
+Supabase's free plan pauses a project after a week without use. If the app shows "The app is starting up",
+check the Supabase dashboard and press **Resume project**.
+
+## Deploy: Netlify + Supabase (previous)
 
 The app is stateless: stock, ledger, sessions and settings live in Supabase Postgres, product photos in a
 public Supabase Storage bucket, the staff app is served by Netlify's CDN and the API runs as one Netlify Function.

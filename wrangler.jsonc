@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "airawat-showroom",
+  "main": "dist/worker.js",
+  "no_bundle": true,
+  "compatibility_date": "2025-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "build": { "command": "npm run build && node scripts/build-worker.js" },
+  "assets": {
+    "directory": "public",
+    "binding": "ASSETS",
+    // Dynamic routes go to the Worker; everything else is a static file.
+    "run_worker_first": ["/api/*", "/p/*", "/c/*"]
+  },
+  // Cloudflare Hyperdrive holds the TLS connection to Supabase (Workers' own TLS upgrade fails with
+  // Supabase's pooler). Query caching is disabled so stock figures are never stale.
+  "hyperdrive": [{ "binding": "HYPERDRIVE", "id": "d97af0511e2b4bf3b74445e3904b7c2a" }],
+  "vars": { "TRUST_PROXY": "1", "MAX_LABELS_PER_BATCH": "600" },
+  "observability": { "enabled": true }
+  // Secrets (set with `npx wrangler secret put`): SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+  // (DATABASE_URL is only used when there is no Hyperdrive binding, e.g. a local database in `wrangler dev`)
+}
