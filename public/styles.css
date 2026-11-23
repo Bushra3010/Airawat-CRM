@@ -51,6 +51,11 @@ main { max-width: 1100px; margin: 0 auto; padding: 14px 16px 30px; outline: none
 /* controls */
 input, select, textarea { width: 100%; font: inherit; color: var(--ink); background: var(--field); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-height: 44px; }
 textarea { min-height: 70px; }
+/* Dropdowns: our own chevron with fixed room on the right (the browser's arrow hugs the edge and ignores padding). */
+select { -webkit-appearance: none; appearance: none; padding-right: 38px; cursor: pointer; text-overflow: ellipsis; white-space: nowrap; overflow: hidden;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%236e665f' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 14px center; background-size: 12px 8px; }
+@media (prefers-color-scheme: dark) { select { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%23a69d95' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); } }
+select:disabled { cursor: default; opacity: .6; }
 input:focus, select:focus, textarea:focus { outline: 2px solid var(--brand); outline-offset: -1px; border-color: transparent; }
 label { display: block; font-size: .85rem; color: var(--muted); margin: 8px 0 2px; }
 label.check { display: flex; align-items: center; gap: 8px; color: var(--ink); font-size: .95rem; margin: 10px 0; }
@@ -70,7 +75,8 @@ label.check input { width: 20px; height: 20px; min-height: 0; }
 .searchbar input { font-size: 1.05rem; min-height: 50px; border-radius: 12px; }
 .searchbar .btn { min-height: 50px; min-width: 50px; font-size: 1.3rem; padding: 0 12px; }
 .chips { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 6px; scrollbar-width: none; }
-.chips select { width: auto; min-height: 36px; padding: 4px 10px; border-radius: 999px; font-size: .85rem; flex: 0 0 auto; }
+.chips select { width: auto; min-height: 36px; padding: 4px 34px 4px 14px; border-radius: 999px; font-size: .85rem; flex: 0 0 auto;
+  background-position: right 13px center; background-size: 11px 7px; }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; margin-top: 8px; }
 .pcard { background: var(--card); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); text-decoration: none; color: inherit; display: flex; flex-direction: column; }
 .pcard .ph { aspect-ratio: 4/3; background: var(--gray-bg); object-fit: cover; width: 100%; display: block; }
